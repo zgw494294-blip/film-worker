@@ -119,7 +119,7 @@ def wait_for_panel(child, startup_log, log):
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("zip",type=Path)
-    parser.add_argument("--simulate",action="store_true",help="Run CFR and VFR mock-manager tests from the installed bundle")
+    parser.add_argument("--simulate",action="store_true",help="Run mock-manager and HDR media tests from the installed bundle")
     args = parser.parse_args()
     verify(args.zip,simulate=args.simulate)
     print("verified offline install, cache reuse and background control panel")

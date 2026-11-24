@@ -88,16 +88,17 @@ def extract_source_frames(source, destination, stream_index, count):
         raise ValueError("Decoded JPEG count differs from presentation timestamp count")
 
 
-def overview(source, destination, stream_index, count):
+def overview(source, destination, stream_index, count, *, scale_options=""):
     slots = min(count, 12)
     indices = [round(Fraction(n * (count - 1), max(1, slots - 1))) for n in range(slots)]
     expression = "+".join(f"eq(n,{i})" for i in indices)
     columns = min(slots, 4)
     rows = math.ceil(slots / columns)
-    filters = f"select='{expression}',scale=320:-2,tile={columns}x{rows}:nb_frames={slots}"
+    filters = f"select='{expression}',scale=320:-2{scale_options},tile={columns}x{rows}:nb_frames={slots}"
     subprocess.run([os.environ.get("FILM_WORKER_FFMPEG", "ffmpeg"), "-nostdin", "-v", "error", "-i", str(source),
                     "-map", f"0:{stream_index}", "-vf", filters, "-an", "-frames:v", "1",
-                    "-q:v", "3", "-update", "1", str(destination)], check=True)
+                    "-q:v", "3", "-update", "1", str(destination)], check=True,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if not destination.is_file() or not destination.stat().st_size:
         raise ValueError("No contact sheet generated")
     return [index + 1 for index in indices]

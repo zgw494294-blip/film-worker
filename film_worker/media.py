@@ -68,16 +68,17 @@ def prepare_source(directory, source, requested_width):
         stage = Path(tmp) / "intake"
         frames = stage / "frames"
         frames.mkdir(parents=True)
-        filters = []
-        if video.get("color_transfer") in ("smpte2084", "arib-std-b67"):
-            filters.extend(["zscale=t=linear:npl=100", "format=gbrpf32le", "zscale=p=bt709",
-                            "tonemap=tonemap=mobius", "zscale=t=bt709:m=bt709:r=limited"])
-        filters += [f"scale={even(dw)}:{even(dh)}:flags=lanczos", "setsar=1", "format=rgb24"]
+        transfer = video.get("color_transfer")
+        hdr_options = ""
+        if transfer in ("smpte2084", "arib-std-b67"):
+            hdr_options = (f":in_transfer={transfer}:out_primaries=bt709:out_transfer=bt709"
+                           ":out_color_matrix=bt709:intent=perceptual")
+        filters = [f"scale={even(dw)}:{even(dh)}:flags=lanczos{hdr_options}", "setsar=1", "format=rgb24"]
         ffmpeg("-i", source, "-map", f"0:{video['index']}", "-an", "-vf", ",".join(filters),
                "-fps_mode", "passthrough", "-start_number", "1", frames / "%04d.png")
         if len(list(frames.glob("[0-9]*.png"))) != len(pts):
             raise ValueError("源片解码后的图片数量与显示时间戳数量不同")
-        intake.overview(source, stage / "overview.jpg", video["index"], len(pts))
+        intake.overview(source, stage / "overview.jpg", video["index"], len(pts), scale_options=hdr_options)
         write_json(stage / "probe.json", metadata)
         write_json(stage / "timeline.json", timeline)
         os.rename(stage, ready)

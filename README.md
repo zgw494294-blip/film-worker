@@ -13,6 +13,8 @@
 
 机器接口见 `contract.openapi.yaml`。Mac 与 Windows 使用同一套锁定源码构建 FFmpeg；领同一制作档案还需使用相符的 Blender、Codex CLI、解码器及执行端版本。不匹配时面板显示要求值和本机值。正式环境使用 HTTPS。与本机模拟服务器联调时，可以在子命令前加 `--test-http`。模型、推理强度、工作流和程序提交由制作档案锁定，节点注册仅公布本机可兑现的档案。
 
+标有 PQ 或 HLG 的原片通过随包 FFmpeg 的色调映射生成 BT.709 抽帧和缩略图。归档包中的原始视频保持上传文件的字节和色彩信息。[FFmpeg 色调映射选项](https://ffmpeg.org/ffmpeg-filters.html#scale)
+
 ## 登录启动
 
 在本机面板点击“启用登录启动”。当前系统账号下次登录后，执行端在后台加载已保存的节点配置，并把启动诊断写入数据目录的 `logs/startup.log`。再次双击原启动文件可打开已有面板，同一数据目录共用一个进程。点击“关闭登录启动”可取消下次登录的自动启动。macOS 使用当前账号的 LaunchAgent，Windows 使用当前账号的计划任务。[macOS LaunchAgent](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html) · [Windows 计划任务](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-create)
@@ -39,7 +41,7 @@
 
 要验证完整的本机 HTTP 联调，将 `FILM_WORKER_TEST_SIMULATION` 设为 `1`，并准备四个制作工具。执行 `uv run --locked python -m unittest discover -s tests -p test_media_simulation.py -v`。测试用固定的 Blender 场景脚本代替在线模型，分别用恒定和可变帧率样片跑领单、下载、1080p 首制、原标注员返修、冻结复审批次、4K 编码和交付包回传，并从成片逐帧读取时间戳和核对总时长。可变帧率用例让同机另一个空数据目录的节点从服务端下载基版和圈选意见，接手返修并核对相邻帧变化。模拟完成回执丢失时，重试只归档一次。
 
-在目标系统的源码目录运行 `uv run --locked python scripts/verify_portable.py <安装包路径>` 可检查安装包摘要、离线安装、重复启动复用、随包媒体工具和本机面板。追加 `--simulate` 时用刚安装的执行端和随包 FFmpeg 运行上述两条模拟流程。测试自动发现 Blender 和 Codex，也可用 `FILM_TEST_BLENDER` 和 `FILM_TEST_CODEX` 指定可执行文件。GitHub Actions 配置会在原生 Apple Silicon Mac 和 Windows x64 上分别验证离线安装，Windows 验收还会下载并校验固定版本的 Blender 和 Codex，运行两条模拟流程。[运行器架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) · [Blender 5.2.3 下载摘要](https://download.blender.org/release/Blender5.2/blender-5.2.3.sha256) · [Codex 0.169.1](https://github.com/openai/codex/releases/tag/rust-v0.169.1)
+在目标系统的源码目录运行 `uv run --locked python scripts/verify_portable.py <安装包路径>` 可检查安装包摘要、离线安装、重复启动复用、随包媒体工具和本机面板。追加 `--simulate` 时用刚安装的执行端和随包 FFmpeg 运行上述两条模拟流程及 HDR 抽帧检查。测试自动发现 Blender 和 Codex，也可用 `FILM_TEST_BLENDER` 和 `FILM_TEST_CODEX` 指定可执行文件。GitHub Actions 配置会在原生 Apple Silicon Mac 和 Windows x64 上分别验证离线安装，Windows 验收还会下载并校验固定版本的 Blender 和 Codex，运行模拟和 HDR 抽帧检查。[运行器架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) · [Blender 5.2.3 下载摘要](https://download.blender.org/release/Blender5.2/blender-5.2.3.sha256) · [Codex 0.169.1](https://github.com/openai/codex/releases/tag/rust-v0.169.1)
 
 
 ## 附件里的验收要求

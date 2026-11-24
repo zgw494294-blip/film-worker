@@ -12,14 +12,21 @@ from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
 
-from film_worker import intake
+from PIL import Image
+
+from film_worker import intake, media
 from film_worker.processes import ProcessTree
 from film_worker.scheduler import Scheduler
-from film_worker.settings import ROOT, inspect_tools, object_hash, resolve_tools
+from film_worker.settings import DEFAULTS, ROOT, inspect_tools, object_hash, resolve_tools
 from test_server_flow import mock_service, node_config, sha
 
 
 REFERENCES = ("version_manifest","scene_bundle","shot_metadata","review_bundle","production_report")
+
+
+def tool_overrides():
+    return {name: os.environ[f"FILM_TEST_{name.upper()}"] for name in ("blender","codex","ffmpeg","ffprobe")
+            if os.environ.get(f"FILM_TEST_{name.upper()}")}
 
 
 def archive(label):
@@ -67,6 +74,36 @@ class WholeMediaSimulation(unittest.TestCase):
     def test_variable_source_timing_survives_revision_by_another_node_and_4k(self):
         self.roundtrip(variable=True)
 
+    def test_hdr_sources_convert_both_pq_and_hlg_to_sdr_review_frames(self):
+        tools = resolve_tools({**DEFAULTS,**tool_overrides()})
+        env = {"FILM_WORKER_FFMPEG":tools["ffmpeg"],"FILM_WORKER_FFPROBE":tools["ffprobe"]}
+        with tempfile.TemporaryDirectory(prefix="worker-hdr-") as directory, patch.dict(os.environ,env):
+            for transfer, sample_x, sdr_value in (("smpte2084",30,54),("arib-std-b67",60,137)):
+                with self.subTest(transfer=transfer):
+                    root = Path(directory)/transfer
+                    root.mkdir()
+                    clip = root/"hdr.mkv"
+                    ramp = ("nullsrc=size=96x32:rate=25,format=yuv420p10le,"
+                            "geq=lum=64+840*X/(W-1):cb=512:cr=512,"
+                            f"setparams=range=limited:color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc")
+                    subprocess.run([tools["ffmpeg"],"-v","error","-f","lavfi","-i",ramp,
+                                    "-frames:v","2","-c:v","ffv1",str(clip)],check=True)
+                    timeline = media.prepare_source(root,clip,1920)
+                    self.assertEqual(Fraction(timeline["duration"]),Fraction(2,25))
+                    frames = sorted((root/"intake/frames").glob("*.png"))
+                    self.assertEqual(len(frames),2)
+                    for path in frames:
+                        with Image.open(path) as im:
+                            values = im.getpixel((sample_x,16))
+                            for channel in values:
+                                self.assertAlmostEqual(channel,sdr_value,delta=3)
+                            self.assertLessEqual(im.getpixel((0,16))[0],3)
+                            self.assertGreater(im.getpixel((95,16))[0],215)
+                    with Image.open(root/"intake/overview.jpg") as review:
+                        self.assertEqual(review.width,640)
+                        preview = review.getpixel((round(sample_x * 320 / 96), review.height//2))
+                        self.assertAlmostEqual(preview[0],sdr_value,delta=6)
+
     def roundtrip(self, *, variable):
         with tempfile.TemporaryDirectory(prefix="worker-local-manager-") as directory, mock_service() as service:
             root = Path(directory)
@@ -75,9 +112,7 @@ class WholeMediaSimulation(unittest.TestCase):
             config = node_config(service)
             config["render_backend"] = "cpu"
             config["cpu_threads"] = 2
-            for name in ("blender","codex","ffmpeg","ffprobe"):
-                if binary := os.environ.get(f"FILM_TEST_{name.upper()}"):
-                    config[name] = binary
+            config.update(tool_overrides())
             tools = resolve_tools(config)
             versions = inspect_tools(tools)
             clip = root/"input.mp4"
