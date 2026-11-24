@@ -69,6 +69,9 @@ class Production:
     def progress(self, stage, count=0, total=None):
         atomic_json(self.progress_path, dict(stage=stage, completed=count, total=total))
 
+    def blender_command(self, *arguments):
+        return [sys.executable, str(HERE / "blender_author.py"), self.tools["blender"], *arguments]
+
     def run_tool(self, name, command, *, stdin=None, env=None, frames=None, stage=None):
         logpath = self.root / (name + ".log")
         with contextlib.ExitStack() as stack:
@@ -232,8 +235,8 @@ class Production:
                 self.author(source)
             self.progress("validate_scene")
             with slot(Path(self.request["resources"]), "blender", self.request["render_slots"]):
-                self.run_tool("blender-prepare", [self.tools["blender"], "-b", "--disable-autoexec", str(scene),
-                                                "--python-exit-code", "1", "-P", str(HERE / "prepare_render.py")],
+                self.run_tool("blender-prepare", self.blender_command("-b", "--disable-autoexec", str(scene),
+                                                "--python-exit-code", "1", "-P", str(HERE / "prepare_render.py")),
                               env=dict(os.environ, MOVIE_JOB_TIMELINE=str(self.root / "intake/timeline.json")))
             validate_meta(meta, self.count)
             atomic_json(prepared, dict(input=expected, scene=digest(scene), meta=digest(meta), environment=self.env))
@@ -296,10 +299,10 @@ class Production:
     def author(self, source):
         self.progress("codex_author")
         p = self.profile
-        blender = subprocess.list2cmdline([sys.executable, str(HERE / "blender_author.py"), self.tools["blender"]])
+        blender = subprocess.list2cmdline(self.blender_command())
         if os.name != "nt":
             import shlex
-            blender = shlex.join([sys.executable, str(HERE / "blender_author.py"), self.tools["blender"]])
+            blender = shlex.join(self.blender_command())
         prompt = self.root / "prompt.txt"
         prompt.write_text(f"""内部试制电影白模。先查看原片和代表帧，制作可编辑的 Blender 场景，后续由人逐帧审片。
 原片 {source}。编号源帧 {self.frames}。规则目录 {self.root/'rules_bundle'}。参考工作流 {self.root/'workflow_bundle'}。
@@ -307,6 +310,8 @@ class Production:
 连续覆盖全部 {self.count} 帧。Blender 帧号为 1–{self.count}，输出比例对应 {self.final_size}。
 若当前目录已有 scene.blend、meta.jsonl、feedback.json，按圈选图及逐帧原意见返修。检查意见前后相邻画面以及全片同类问题。
 优先保证构图、场景和动作的时空对应。不得改动输入文件，不得交付用原始视频做贴图的平面。
+首制和返修只需处理画面与镜头说明。执行端会在出片阶段按原始时码回配并校验同期声。
+只有本批验收规则明确要求工程内携带音轨时，才在 Blender 内添加音轨。成片混音由执行端完成。
 只用无界面的 Blender，启动前缀 {blender}，传 -b 和 --python-exit-code 1。最终工程内打包使用的外部资源。
 {quality.REVIEW_CHECKLIST}""", encoding="utf-8")
         command = model.options(self.tools["codex"], p, self.stage, sandbox="workspace-write")
@@ -341,9 +346,9 @@ class Production:
                 shutil.rmtree(frames)
             atomic_json(recorded, tag)
             check_rendered_frames(frames, target, self.count, complete=False)
-            args = [self.tools["blender"], "-b", "--disable-autoexec", str(scene), "--python-exit-code", "1", "-P",
+            args = self.blender_command("-b", "--disable-autoexec", str(scene), "--python-exit-code", "1", "-P",
                     str(HERE / "render_frames.py"), "--", str(frames), option, *map(str,target),
-                    str(self.request["cpu_threads"])]
+                    str(self.request["cpu_threads"]))
             self.progress(f"render_{purpose}_{option}", 0, self.count)
             try:
                 self.run_tool(f"blender-{purpose}-{option}", args, frames=frames, stage=f"render_{purpose}_{option}")

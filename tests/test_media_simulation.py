@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import zipfile
+from contextlib import nullcontext
 from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from film_worker import intake, media
+from film_worker.model import MODEL_FIELDS
 from film_worker.processes import ProcessTree
 from film_worker.scheduler import Scheduler
 from film_worker.settings import DEFAULTS, ROOT, inspect_tools, object_hash, resolve_tools
@@ -53,18 +55,29 @@ def source_clip(ffmpeg, path, *, variable):
                     *select,"-fps_mode","vfr","-frames:v","3","-c:v","mpeg4","-c:a","aac",str(path)],check=True)
 
 
+def codex_source_clip(ffmpeg, path):
+    scene = "color=c=0x262626:size=640x360:rate=24:duration=0.125,drawbox=x=245:y=105:w=150:h=150:c=white:t=fill"
+    subprocess.run([ffmpeg,"-v","error","-f","lavfi","-i",scene,
+                    "-f","lavfi","-i","sine=frequency=440:sample_rate=44100:duration=0.125",
+                    "-c:v","mpeg4","-c:a","aac",str(path)],check=True)
+
+
 @unittest.skipUnless(os.environ.get("FILM_WORKER_TEST_SIMULATION")=="1","requires local Blender and media tools")
 class WholeMediaSimulation(unittest.TestCase):
-    def wait_work(self, service, worker, work):
-        end = time.monotonic()+70
+    def wait_work(self, service, worker, work, timeout):
+        end = time.monotonic()+timeout
         while time.monotonic()<end:
             with service.mutex:
                 job = service.attempts[work]
                 if job["state"]=="succeeded" and not worker.summary()["active"]:
                     return
                 if job["state"]=="failed":
-                    log = worker.root/"work"/work/"1/worker.log"
-                    self.fail(f"{job['error']}\n{log.read_text(encoding='utf-8',errors='replace')[-1800:] if log.exists() else ''}")
+                    directory = worker.root/"work"/work/"1"
+                    logs = [directory/name for name in ("worker.log","blender-prepare.log","blender-review-cpu.log",
+                                                         "blender-final-cpu.log")]
+                    self.fail(f"{job['error']}\n"+"\n".join(
+                        f"{log.name}\n{log.read_text(encoding='utf-8',errors='replace')[-1500:]}"
+                        for log in logs if log.is_file()))
             time.sleep(0.15)
         self.fail(str(worker.summary()))
 
@@ -73,6 +86,11 @@ class WholeMediaSimulation(unittest.TestCase):
 
     def test_variable_source_timing_survives_revision_by_another_node_and_4k(self):
         self.roundtrip(variable=True)
+
+    @unittest.skipUnless(os.getenv("FILM_WORKER_TEST_REAL_CODEX")=="1","requires a locally authenticated Codex profile")
+    def test_real_codex_authors_and_revises_work_received_from_the_mock_manager(self):
+        model = {field: os.environ["FILM_TEST_"+field.upper()] for field in MODEL_FIELDS}
+        self.roundtrip(variable=False,model=model)
 
     def test_hdr_sources_convert_both_pq_and_hlg_to_sdr_review_frames(self):
         tools = resolve_tools({**DEFAULTS,**tool_overrides()})
@@ -104,7 +122,7 @@ class WholeMediaSimulation(unittest.TestCase):
                         preview = review.getpixel((round(sample_x * 320 / 96), review.height//2))
                         self.assertAlmostEqual(preview[0],sdr_value,delta=6)
 
-    def roundtrip(self, *, variable):
+    def roundtrip(self, *, variable, model=None):
         with tempfile.TemporaryDirectory(prefix="worker-local-manager-") as directory, mock_service() as service:
             root = Path(directory)
             data = root/"节点 数据"
@@ -116,23 +134,37 @@ class WholeMediaSimulation(unittest.TestCase):
             tools = resolve_tools(config)
             versions = inspect_tools(tools)
             clip = root/"input.mp4"
-            source_clip(tools["ffmpeg"],clip,variable=variable)
+            if model:
+                codex_source_clip(tools["ffmpeg"],clip)
+                rule_text = ("本次为流程验收用合成片，只制作灰底上一个白色正方形。使用正交相机、固定白色材质和低采样的 "
+                             "Cycles CPU。首制对齐原片的白色方形。出现返修意见时，以意见里的目标位置为准。"
+                             "音轨由执行端在出片时回配，本样片的 Blender 工程只包含画面。")
+                workflow_text = ("先查看编号源帧。用命令行 Blender 创建工程和可编辑的物体，必要时用自发光材质。"
+                                 "时间线是 1–3 帧，固定镜头。输出 scene.blend 和覆盖三帧的 meta.jsonl。")
+                note = "将白色方块在画面上整体向右移动约 80 个原片像素，三个画面保持相同的缩放和移动后的构图。"
+            else:
+                source_clip(tools["ffmpeg"],clip,variable=variable)
+                rule_text, workflow_text, note = "test rules", "test workflow", "主体右移"
             source = service.store("source_video",clip.read_bytes(),"video/mp4")
-            rules = service.store("rules_bundle",archive("test rules"),"application/zip")
-            workflow = service.store("workflow_bundle",archive("test workflow"),"application/zip")
+            rules = service.store("rules_bundle",archive(rule_text),"application/zip")
+            workflow = service.store("workflow_bundle",archive(workflow_text),"application/zip")
             defaults = {"source_video":source,"rules_bundle":rules,"workflow_bundle":workflow}
             profile = service.profile
+            if model:
+                profile.update(model)
             profile["compatibility"].update(versions,rules_sha256=rules["sha256"],workflow_sha256=workflow["sha256"])
             profile.pop("profile_hash")
             profile["profile_hash"] = object_hash(profile)
 
-            with patch("film_worker.scheduler.ProcessTree",start_fixture):
+            timeout = 360 if model else 70
+            scene_authoring = nullcontext() if model else patch("film_worker.scheduler.ProcessTree",start_fixture)
+            with scene_authoring:
                 node = Scheduler(config,data,"fixture",test_http=True)
                 worker = threading.Thread(target=node.run)
                 try:
                     first = service.schedule("prepare",1,artifacts=list(defaults.values()))
                     worker.start()
-                    self.wait_work(service,node,first)
+                    self.wait_work(service,node,first,timeout)
                     self.assertEqual(service.completed,[first],"人工审核前应等待")
                     artifacts = service.blobs_from(first)
                     version1 = json.loads(artifacts["version_manifest"])
@@ -153,7 +185,7 @@ class WholeMediaSimulation(unittest.TestCase):
                                   timeline_sha256=version1["timeline_sha256"])
                     feedback = dict(status,origin="review",review_size=version1["review_size"],
                                     frames=[dict(number=2,review_signature=frame1["review_signature"],
-                                                note="主体右移",regions=[dict(x=0.3,y=0.64,w=0.4,h=0.3,note="核对主体位置")])])
+                                                note=note,regions=[dict(x=0.3,y=0.64,w=0.4,h=0.3,note="核对主体位置")])])
                     feedback_artifact = service.store("feedback_manifest",json_blob(feedback),"application/json")
                     approve = self.approval(service,version1,status,all_frames=False)
                     if variable:
@@ -167,21 +199,30 @@ class WholeMediaSimulation(unittest.TestCase):
                         worker.start()
                     revised = service.schedule("revise",2,artifacts=[*defaults.values(),*timeline,
                         *service.outputs_from(first,*REFERENCES),feedback_artifact,approve])
-                    self.wait_work(service,node,revised)
+                    self.wait_work(service,node,revised,timeout)
                     self.assertEqual(service.workers["fixture"]!=node.session["worker_id"],variable)
                     self.assertTrue((node.root/"work"/revised/"1/scene/feedback-images/0002.jpg").is_file())
                     new = service.blobs_from(revised)
                     version2 = json.loads(new["version_manifest"])
                     changes = [before["number"] for before,after in zip(version1["frames"],version2["frames"],strict=True)
                                if before["review_signature"]!=after["review_signature"]]
-                    self.assertEqual(changes,[2,3] if variable else [2])
+                    if model:
+                        self.assertIn(2,changes)
+                        for recorded in (version1,version2):
+                            self.assertEqual(recorded["environment"]["model_evidence"],"observed")
+                            for field, expected in model.items():
+                                self.assertEqual(recorded["environment"][field],expected)
+                        carried = {1}-set(changes)
+                    else:
+                        self.assertEqual(changes,[2,3] if variable else [2])
+                        carried = {1}
                     self.assertEqual(version1["source_sha256"],version2["source_sha256"])
                     self.assertFalse(any(w=="work-finalize" for w in service.completed),"全部通过前不得出片")
                     status.update(base_version=2,base_manifest_sha256=sha(new["version_manifest"]))
-                    approve = self.approval(service,version2,status,all_frames=True)
+                    approve = self.approval(service,version2,status,all_frames=True,carried=carried)
                     export = service.schedule("finalize",2,artifacts=[*defaults.values(),*timeline,
                         *service.outputs_from(revised,*REFERENCES),approve],drop_reply=True)
-                    self.wait_work(service,node,export)
+                    self.wait_work(service,node,export,timeout)
                     result = service.blobs_from(export)
                     receipt = service.attempts[export]["body"]["final_verification"]
                     self.assertEqual(receipt["white_size"],{"width":3840,"height":2160})
@@ -206,10 +247,10 @@ class WholeMediaSimulation(unittest.TestCase):
                     if worker.ident:
                         worker.join(timeout=20)
 
-    def approval(self, service, version, status, *, all_frames):
+    def approval(self, service, version, status, *, all_frames, carried=()):
         subset = version["frames"] if all_frames else [version["frames"][0]]
         entry = dict(status,scope="all_frames" if all_frames else "approved_subset",
                      **{k:version[k] for k in ("source_sha256","profile_hash","scene_sha256","frame_count")})
         entry["frames"] = [dict(number=f["number"],review_signature=f["review_signature"],
-                                approved_version=1 if f["number"]==1 else version["version"]) for f in subset]
+                                approved_version=1 if f["number"] in carried else version["version"]) for f in subset]
         return service.store("approval_manifest",json_blob(entry),"application/json")

@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import wave
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -102,6 +103,11 @@ class ProductionTests(unittest.TestCase):
 def author_fixture(worker, source):
     preparing = worker.kind == "prepare"
     script = worker.root / "author.py"
+    sound_file = worker.stage / "packed-reference.wav"
+    if preparing:
+        with wave.open(str(sound_file), "wb") as sound:
+            sound.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+            sound.writeframes(bytes(12000))
     script.write_text(f"""import bpy
 s = bpy.context.scene
 s.render.engine = "CYCLES"
@@ -109,7 +115,13 @@ s.cycles.samples = 1
 s.cycles.use_denoising = False
 s.frame_start = 1
 s.frame_end = {worker.count}
-if not {preparing!r}:
+if {preparing!r}:
+    sequence = s.sequence_editor_create()
+    strips = sequence.strips if hasattr(sequence, "strips") else sequence.sequences
+    strip = strips.new_sound("packed reference", {str(sound_file)!r}, 1, 1)
+    strip.sound.pack()
+    strip.sound.filepath = "//packed-reference.wav"
+else:
     subject = bpy.data.objects["Cube"]
     for frame, x in ((1, 0), (2, 1), (3, {int(worker.timeline["variable_rate"])})):
         subject.location.x = x
@@ -121,5 +133,7 @@ bpy.ops.wm.save_as_mainfile(filepath={str(worker.stage / 'scene.blend')!r})
     if not preparing:
         command.append(str(worker.stage/"scene.blend"))
     worker.run_tool("fixture-author", [*command, "--python-exit-code", "1", "-P", str(script)])
+    if preparing:
+        sound_file.unlink()
     metadata = worker.stage / "meta.jsonl"
     metadata.write_text(json.dumps(dict(start_frame=1,end_frame=worker.count,description="fixture shot"))+"\n")
