@@ -129,15 +129,26 @@ class Releases:
         if project.exists():
             shutil.rmtree(project)
         try:
-            run([*git, "archive", "--format=zip", "--output", str(archive_path), commit], env=env)
+            # The signed lock digest applies to repository bytes on every host.
+            run([*git, "-c", "core.autocrlf=false", "archive", "--format=zip", "--output", str(archive_path), commit], env=env)
             # The virtual environment must be created in its final path on both systems.
             bundles.extract(archive_path, project, indexed=False)
             if meta["lock_sha256"] != digest(project / "uv.lock"):
                 raise ValueError("发布清单的依赖摘要与实际锁文件不一致")
             runtime_env = {**env, "UV_PROJECT_ENVIRONMENT": str(project / ".venv")}
             base_python = getattr(sys, "_base_executable", sys.executable)
-            run([uv, "sync", "--locked", "--no-install-project", "--python", base_python],
-                cwd=project, env=runtime_env, timeout=240)
+            requirements = portable_requirements(meta["lock_sha256"])
+            if requirements:
+                offline_env = {**runtime_env, "UV_OFFLINE": "1", "UV_NO_CONFIG": "1", "UV_PYTHON_DOWNLOADS": "never"}
+                run([uv, "lock", "--check", "--offline", "--python", base_python], cwd=project, env=offline_env)
+                run([uv, "venv", "--offline", "--no-project", "--python", base_python, str(project / ".venv")],
+                    cwd=project, env=offline_env)
+                run([uv, "pip", "sync", "--require-hashes", "--no-index", "--offline",
+                     "--find-links", str(requirements.with_name("wheels")), "--python", str(executable(project)),
+                     str(requirements)], cwd=project, env=offline_env, timeout=240)
+            else:
+                run([uv, "sync", "--locked", "--no-install-project", "--python", base_python],
+                    cwd=project, env=runtime_env, timeout=240)
             with tempfile.TemporaryDirectory(prefix="worker-update-check-") as tmp:
                 run([str(executable(project)), "-m", "film_worker", "--data", tmp, "self-test"],
                     cwd=project, env=runtime_env, timeout=45)
@@ -163,6 +174,26 @@ def bundled_uv(project):
         if path.is_file():
             return str(path)
     return None
+
+
+def portable_requirements(lock_sha256):
+    bootstrap = Path(os.environ.get("FILM_WORKER_BOOTSTRAP", ROOT))
+    lock = bootstrap / "uv.lock"
+    runtime = bootstrap / "runtime"
+    requirements = runtime / "wheels.txt"
+    manifest = runtime / "manifest.json"
+    python = Path(os.environ.get("FILM_WORKER_BOOTSTRAP_PYTHON", sys.executable))
+    marker = python.parent.parent.parent / "installed.txt"
+    if not (lock.is_file() and digest(lock) == lock_sha256 and marker.is_file()
+            and manifest.is_file() and requirements.is_file() and (runtime / "wheels").is_dir()):
+        return None
+    if marker.read_text(encoding="ascii") != digest(manifest):
+        raise ValueError("安装包依赖清单与已验证的本机安装不一致")
+    contents = json.loads(manifest.read_text(encoding="utf-8"))
+    expected = next((item["sha256"] for item in contents["files"] if item["path"] == "wheels.txt"), None)
+    if expected != digest(requirements):
+        raise ValueError("安装包依赖清单的摘要不符")
+    return requirements
 
 
 def reopen(root, browser):

@@ -14,7 +14,7 @@ class ProcessTree:
             if os.name == "nt":
                 import win32api
                 import win32job
-                self.job = win32job.CreateJobObject(None, None)
+                self.job = win32job.CreateJobObject(None, "")
                 limits = win32job.QueryInformationJobObject(self.job, win32job.JobObjectExtendedLimitInformation)
                 limits["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
                 win32job.SetInformationJobObject(self.job, win32job.JobObjectExtendedLimitInformation, limits)

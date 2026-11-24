@@ -170,9 +170,13 @@ class ArtifactTests(unittest.TestCase):
             for i, member in enumerate(["../secret", "nested/CON.txt", "nested\\danger"]):
                 archive = temp / f"invalid{i}.zip"
                 with zipfile.ZipFile(archive, "w") as z:
-                    z.writestr(member, b"bad")
-                with self.assertRaises(ValueError):
-                    bundles.extract(archive, temp/f"unpacked{i}", indexed=False)
+                    # ZipFile normalizes path separators when given a filename on Windows.
+                    raw = zipfile.ZipInfo("placeholder")
+                    raw.filename = member
+                    z.writestr(raw, b"bad")
+                with self.subTest(member=member):
+                    with self.assertRaises(ValueError):
+                        bundles.extract(archive, temp/f"unpacked{i}", indexed=False)
 
     def test_bundle_roundtrip_and_idempotent_completion_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -211,7 +215,7 @@ class ArtifactTests(unittest.TestCase):
             path = Path(tmp)/"clip.mp4"
             subprocess.run(["ffmpeg","-v","error","-f","lavfi","-i","color=white:size=128x72:rate=24",
                             "-frames:v","3","-vf","drawbox=t=fill:c=black:enable='eq(n,2)'",
-                            "-c:v","libx264",str(path)], check=True)
+                            "-c:v","mpeg4",str(path)], check=True)
             data = quality.read_video("white_video", path, scan_black=True)
             self.assertEqual(data["black_frames"], [3])
             self.assertEqual(data["black_tail_frames"], [3])

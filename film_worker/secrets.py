@@ -21,8 +21,8 @@ def read_token(root):
         except error as exc:
             if exc.winerror == 1168:
                 return ""
-            raise
-        return saved["CredentialBlob"].decode("utf-8")
+            raise windows_credential_error(exc, "读取") from exc
+        return saved["CredentialBlob"].decode("utf-16-le")
     result = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", target, "-w"],
                             capture_output=True, text=True, check=False)
     return result.stdout.strip() if result.returncode == 0 else ""
@@ -34,9 +34,13 @@ def store_token(root, token):
     target = label(root)
     if os.name == "nt":
         import win32cred
-        win32cred.CredWrite(dict(Type=win32cred.CRED_TYPE_GENERIC, TargetName=target,
-                                Persist=win32cred.CRED_PERSIST_LOCAL_MACHINE,
-                                CredentialBlob=token.encode("utf-8")), 0)
+        from pywintypes import error
+        try:
+            win32cred.CredWrite(dict(Type=win32cred.CRED_TYPE_GENERIC, TargetName=target,
+                                    Persist=win32cred.CRED_PERSIST_LOCAL_MACHINE,
+                                    CredentialBlob=token), 0)
+        except error as exc:
+            raise windows_credential_error(exc, "保存") from exc
     else:
         # Feed security's command interpreter via stdin so the token stays out of process arguments.
         import shlex
@@ -45,3 +49,10 @@ def store_token(root, token):
                                 text=True, check=False)
         if result.returncode != 0 or read_token(root) != token:
             raise ValueError("macOS 钥匙串保存失败")
+
+
+def windows_credential_error(exc, operation):
+    if exc.winerror == 1312:
+        return ValueError("当前 Windows 登录会话无法访问凭据管理器。请在桌面会话配置建模 Token，"
+                          "或在部署环境设置 FILM_WORKER_TOKEN")
+    return ValueError(f"Windows 凭据管理器{operation}失败（错误 {exc.winerror}）")

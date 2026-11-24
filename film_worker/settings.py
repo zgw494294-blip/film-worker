@@ -93,6 +93,30 @@ def validate_config(settings):
     return config
 
 
+def windows_desktop_codex():
+    powershell = shutil.which("powershell.exe")
+    if not powershell:
+        return None
+    script = (
+        "$ProgressPreference='SilentlyContinue'; "
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+        "$app=Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "if ($app) { [Console]::WriteLine((Join-Path $app.InstallLocation 'app\\resources\\codex.exe')) }"
+    )
+    try:
+        result = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, check=True, timeout=10, encoding="utf-8",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        path = Path(result.stdout.strip())
+        if path.is_absolute() and path.is_file():
+            return str(path)
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    return None
+
+
 def resolve_tools(config):
     mac = {
         "blender": ["/Applications/Blender.app/Contents/MacOS/Blender"],
@@ -129,6 +153,9 @@ def resolve_tools(config):
                     continue
                 tools[name] = str(Path(candidate).resolve())
                 break
+        if name == "codex" and os.name == "nt" and not config[name] and name not in tools:
+            if desktop := windows_desktop_codex():
+                tools[name] = desktop
         if name not in tools:
             raise ValueError(f"找不到 {name}，请设置可执行文件路径")
     return tools

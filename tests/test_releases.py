@@ -42,6 +42,7 @@ class ReleaseTests(unittest.TestCase):
             self.publish(remote, 1, signed=False)
             with self.assertRaises(ValueError):
                 Releases(data).stage(config)
+            self.run_command(["git", "-C", str(Releases(data).repository), "config", "core.autocrlf", "true"])
             self.publish(remote, 2)
 
             with socket.socket() as candidate_port:

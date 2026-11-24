@@ -6,7 +6,7 @@
 
 1. 将与机器架构匹配的 ZIP 解压到本机。Apple Silicon 选择 `macos-arm64`，Windows 选择 `windows-x86_64`。离线包包含 CPython、uv、锁定的 Python 媒体库、FFmpeg 9.0.2、FFprobe 和目标系统组件。首次打开自动校验并安装到本机数据目录，再次打开沿用已有依赖。单独下载的开发源码可用本机 uv 安装。
 2. macOS 打开 `启动执行端.command`，Windows 打开 `启动执行端.cmd`。如需独立数据盘，给启动程序传入 `--data <目录>`。配置页只在本机回环地址监听。
-3. 准备 Blender 和已登录的 Codex CLI。离线安装会同时配置媒体工具，已有配置可在“工具路径”覆盖。macOS 可自动发现 Applications 里的 Blender 与 ChatGPT 所带 CLI。Windows 支持配置原生 `codex.exe` 和 `blender.exe` 等绝对路径，也会查找常见的 npm Codex 目录。[Codex 官方原生包布局](https://github.com/openai/codex/blob/main/codex-cli/scripts/build_npm_package.py)
+3. 准备 Blender 和已登录的 Codex CLI。离线安装会同时配置媒体工具，已有配置可在“工具路径”覆盖。macOS 可自动发现 Applications 里的 Blender 与 ChatGPT 所带 CLI。Windows 可复用当前账号安装的 Codex 桌面应用所带 CLI，也会查找常见的 npm Codex 目录。可在面板指定原生 `codex.exe` 和 `blender.exe` 的绝对路径。[Codex 官方原生包布局](https://github.com/openai/codex/blob/main/codex-cli/scripts/build_npm_package.py)
 4. 保存公网服务 URL、管理员发放的节点标识、建模 Token 和服务端下发的制作档案数组。点击“检测本机工具”查看本机工具与执行端版本，也可以在“模型与制作档案”测试已保存的 Codex 调用。更换服务商、模型或推理强度可生成新档案，由管理员使用相同档案派发。然后启动节点。调整配置前，暂停领单并等待在途工单交回。关闭浏览器可以在启动进程存续期间继续制作。
 
 开发目录中可用 `uv run --locked python -m film_worker launch` 打开带更新功能的面板，也可用 `uv run --locked python -m film_worker run` 直接启动执行服务。机器 Token 保存在 macOS 钥匙串或 Windows 凭据管理器，部署脚本也可通过 `FILM_WORKER_TOKEN` 注入。Codex 的登录和模型服务凭证保存在本机 Codex 配置中。
@@ -29,7 +29,7 @@
 
 自动检查可指定本机时区内的起止时间。例如 23:00 至次日 05:00，检查及准备更新从这一时间段内开始，安装在当前工单提交后进行。开始和结束时间均留空时，按设置的频率全天检查。
 
-用本地 Git 仓库模拟发布与网络 Git 使用相同的签名和版本规则。开发启动目录应保留，因为它是首次安装的启动器和首次回退目标。更新所需的依赖从锁文件安装，优先复用本机 uv 缓存。
+用本地 Git 仓库模拟发布与网络 Git 使用相同的签名和版本规则。开发启动目录应保留，因为它是首次安装的启动器和首次回退目标。依赖锁文件相同时，用初始安装包里的依赖离线准备新版。依赖有变更时，按新锁文件安装并复用本机 uv 缓存。
 
 ## 制作安装包
 
