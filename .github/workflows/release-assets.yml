@@ -1,0 +1,73 @@
+name: Attach verified worker packages
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing signed version tag with a draft release
+        type: string
+        required: true
+      verification_run:
+        description: Run ID containing the verified worker packages
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      VERIFICATION_RUN: ${{ inputs.verification_run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download and validate the packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$VERIFICATION_RUN" =~ ^[0-9]+$ ]]
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = true
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=release.allowed_signers verify-tag "$RELEASE_TAG"
+          RELEASE_COMMIT=$(git rev-parse "$RELEASE_TAG^{commit}")
+          export RELEASE_COMMIT
+          gh run view "$VERIFICATION_RUN" --json jobs | jq -e '
+            any(.jobs[].steps[]; .name == "Exercise offline installation and the installed panel on Mac" and .conclusion == "success") and
+            any(.jobs[].steps[]; .name == "Verify offline installation, 1080p review, and 1080p and 4K export on Windows" and .conclusion == "success")
+          '
+          gh run download "$VERIFICATION_RUN" --pattern 'worker-*' --dir packages
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import zipfile
+          from pathlib import Path
+
+          output = Path("release-assets")
+          output.mkdir()
+          for target in ("macos-arm64", "windows-x86_64"):
+              source, = (Path("packages") / f"worker-{target}").glob("*.zip")
+              expected = source.with_suffix(".zip.sha256").read_text(encoding="utf-8").split()[0]
+              with source.open("rb") as asset:
+                  checksum = hashlib.file_digest(asset, "sha256").hexdigest()
+              if checksum != expected:
+                  raise ValueError(f"Artifact checksum mismatch for {target}")
+              with zipfile.ZipFile(source) as package:
+                  build = json.loads(package.read("film-worker/runtime/build.json"))
+                  if build["commit"] != os.environ["RELEASE_COMMIT"]:
+                      raise ValueError(f"Artifact commit mismatch for {target}")
+              asset = output / f"film-worker-{os.environ['RELEASE_TAG']}-{target}.zip"
+              source.rename(asset)
+              asset.with_suffix(".zip.sha256").write_text(f"{checksum}  {asset.name}\n", encoding="ascii")
+              print(asset.name, checksum)
+          PY
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$RELEASE_TAG" release-assets/*.zip release-assets/*.sha256 --clobber
