@@ -172,9 +172,10 @@ class Scheduler:
         except (OSError, ValueError):
             return fallback.copy()
 
-    def note(self, status, success=False):
+    def note(self, status, success=False, *, detail=None):
         with self.lock:
             self.status["connection"] = status
+            self.status["detail"] = detail
             if success:
                 self.status["last_success"] = datetime.now(timezone.utc).isoformat()
 
@@ -227,8 +228,11 @@ class Scheduler:
                         self.session = {}
                     self.stop.wait(max(retry, min(exc.retry_after or 0, 60)))
                     retry = min(30, retry * 2)
-                except (ValueError, OSError, KeyError) as exc:
-                    self.note(f"configuration: {type(exc).__name__}")
+                except ValueError as exc:
+                    self.note("configuration_error",detail=str(exc))
+                    self.stop.wait(5)
+                except (OSError, KeyError) as exc:
+                    self.note("configuration_error",detail=type(exc).__name__)
                     self.stop.wait(5)
         finally:
             with self.lock:

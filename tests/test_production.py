@@ -22,7 +22,8 @@ class ProductionTests(unittest.TestCase):
             base = Path(root)
             src = base / "source.mp4"
             subprocess.run([tools["ffmpeg"], "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24",
-                            "-frames:v", "3", "-c:v", "libx264", str(src)], check=True)
+                            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "0.125",
+                            "-c:v", "mpeg4", "-c:a", "aac", str(src)], check=True)
             paths = {"source_video": str(src)}
             for role in ("rules_bundle", "workflow_bundle"):
                 artifact = base / (role + ".zip")
@@ -88,6 +89,9 @@ class ProductionTests(unittest.TestCase):
                 records = [json.loads(row) for row in lines]
                 self.assertEqual([r["role"] for r in records], ["source_video", "white_video", "comparison_video"])
                 self.assertEqual({r["sample_id"] for r in records}, {"job1"})
+                for rendered in records[1:]:
+                    track = rendered["audio"][0]
+                    self.assertEqual((track["codec"], track["channels"], track["sample_rate"]), ("aac", 2, 48000))
 
 
 def author_fixture(worker, source):

@@ -41,6 +41,7 @@ def verify(path):
                              capture_output=True,encoding="utf-8",check=True,timeout=80)
         python = Path(out.stdout.strip().splitlines()[-1])
         marker = next((data/"runtime").glob("*/installed.txt"))
+        verify_media_tools(marker.parent / "tools", root,env)
         since = marker.stat().st_mtime_ns
         out = subprocess.run([*setup,"--install-only"],cwd=project,env=env,
                              capture_output=True,encoding="utf-8",check=True,timeout=15)
@@ -58,6 +59,25 @@ def verify(path):
                     else:
                         os.killpg(child.pid,signal.SIGINT)
                     child.wait(timeout=15)
+
+
+def verify_media_tools(tools, temp, env):
+    suffix = ".exe" if os.name=="nt" else ""
+    command = tools/("ffmpeg"+suffix)
+    probe = tools/("ffprobe"+suffix)
+    if not command.is_file() and not probe.is_file():
+        return
+    for program in (command,probe):
+        line = subprocess.check_output([str(program),"-version"],env=env,encoding="utf-8",timeout=12).splitlines()[0]
+        if " version 9.0.2 " not in line:
+            raise ValueError("安装包中的媒体工具版本不匹配")
+    clip = temp/"验收短片.mp4"
+    subprocess.run([str(command),"-v","error","-f","lavfi","-i","testsrc2=size=96x64:rate=24",
+                    "-frames:v","4","-c:v","mpeg4",str(clip)],env=env,check=True,timeout=15)
+    info = json.loads(subprocess.check_output([str(probe),"-v","error","-show_frames","-of","json",str(clip)],
+                                             env=env,encoding="utf-8",timeout=15))
+    if len(info["frames"]) != 4 or not all(frame["width"]==96 and frame["height"]==64 for frame in info["frames"]):
+        raise ValueError("随包媒体工具未按原画幅逐帧解码")
 
 
 def wait_for_panel(child, log):

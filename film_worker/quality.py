@@ -1,8 +1,9 @@
 """Production guidance and verifiable media acceptance checks."""
 import json
-import re
-import subprocess
 from fractions import Fraction
+
+import av
+from PIL import Image
 
 from . import intake
 
@@ -31,17 +32,26 @@ def may_author(profile, kind):
     return policy(profile) != "human_required" or kind == "finalize"
 
 
-def read_video(role, path, *, ffmpeg, scan_black=False):
+def detect_black_frames(path, video_stream, frame_count):
+    black = []
+    decoded = 0
+    with av.open(str(path)) as container:
+        stream = next(s for s in container.streams.video if s.index == video_stream)
+        for decoded, frame in enumerate(container.decode(stream),1):
+            gray = frame.reformat(format="gray")
+            plane = gray.planes[0]
+            image = Image.frombytes("L", (gray.width, gray.height), bytes(plane), "raw", "L", plane.line_size, 1)
+            if image.getextrema()[1] <= 5:
+                black.append(decoded)
+    if decoded != frame_count:
+        raise ValueError("黑帧检查的解码帧数与时间线不一致")
+    return black
+
+
+def read_video(role, path, *, scan_black=False):
     raw, video, pts, time_base, duration, _ = intake.measure(path)
     tracks = [stream for stream in raw["streams"] if stream["codec_type"] == "audio"]
-    black_frames = []
-    if scan_black:
-        threshold = 5 if video.get("color_range") in {"pc", "jpeg"} else 21
-        command = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "info", "-i", str(path),
-                   "-vf", f"blackframe=amount=100:threshold={threshold}", "-an", "-f", "null", "-"]
-        proc = subprocess.run(command, capture_output=True, text=True, errors="replace", check=True)
-        black_indices = [int(x)+1 for x in re.findall(r"\[Parsed_blackframe[^\]]*\]\s+frame:\s*(\d+)", proc.stderr)]
-        black_frames = [i for i in black_indices if i <= len(pts)]
+    black_frames = detect_black_frames(path, video["index"], len(pts)) if scan_black else []
     starts = [tick-pts[0] for tick in pts]
     start_of_last_second = max(Fraction(0), duration-1)
     tail = [i for i in black_frames if (starts[i] if i < len(starts) else duration/time_base)*time_base >
@@ -64,11 +74,11 @@ def validate_formal(record):
         raise ValueError(f"{record['role']} 未达到正式批次的横幅、分辨率、时长、帧率或编码要求")
 
 
-def media_report(path, sample_id, files, *, ffmpeg, formal):
+def media_report(path, sample_id, files, *, formal):
     """Save three technical JSONL rows and fail if generated outputs contain black frames."""
     rows = []
     for role, file in files:
-        data = read_video(role, file, ffmpeg=ffmpeg, scan_black=role != "source_video" or formal)
+        data = read_video(role, file, scan_black=role != "source_video" or formal)
         data.update(sample_id=sample_id, file=file.relative_to(path.parent.parent).as_posix())
         if role != "source_video" and data["audio"]:
             data["audio_target_bitrate"] = 320_000

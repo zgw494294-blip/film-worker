@@ -4,14 +4,14 @@
 
 ## 安装和连接
 
-1. 将与机器架构匹配的 ZIP 解压到本机。Apple Silicon 选择 `macos-arm64`，Windows 选择 `windows-x86_64`。离线包包含 CPython、uv、锁定的 Python 媒体库和 Windows 本地系统组件。首次打开自动校验并安装到本机数据目录，再次打开沿用已有依赖。单独下载的开发源码可用本机 uv 安装。
+1. 将与机器架构匹配的 ZIP 解压到本机。Apple Silicon 选择 `macos-arm64`，Windows 选择 `windows-x86_64`。离线包包含 CPython、uv、锁定的 Python 媒体库、FFmpeg 9.0.2、FFprobe 和目标系统组件。首次打开自动校验并安装到本机数据目录，再次打开沿用已有依赖。单独下载的开发源码可用本机 uv 安装。
 2. macOS 打开 `启动执行端.command`，Windows 打开 `启动执行端.cmd`。如需独立数据盘，给启动程序传入 `--data <目录>`。配置页只在本机回环地址监听。
-3. 准备 Blender、FFmpeg/FFprobe 和已登录的 Codex CLI。macOS 可自动发现 Applications 里的 Blender 与 ChatGPT 所带 CLI。Windows 支持配置原生 `codex.exe` 和 `blender.exe` 等绝对路径，也会查找常见的 npm Codex 目录。[Codex 官方原生包布局](https://github.com/openai/codex/blob/main/codex-cli/scripts/build_npm_package.py)
+3. 准备 Blender 和已登录的 Codex CLI。离线安装会同时配置媒体工具，已有配置可在“工具路径”覆盖。macOS 可自动发现 Applications 里的 Blender 与 ChatGPT 所带 CLI。Windows 支持配置原生 `codex.exe` 和 `blender.exe` 等绝对路径，也会查找常见的 npm Codex 目录。[Codex 官方原生包布局](https://github.com/openai/codex/blob/main/codex-cli/scripts/build_npm_package.py)
 4. 保存公网服务 URL、管理员发放的节点标识、建模 Token 和服务端下发的制作档案数组。点击“检测本机工具”查看本机工具与执行端版本，也可以在“模型与制作档案”测试已保存的 Codex 调用。更换服务商、模型或推理强度可生成新档案，由管理员使用相同档案派发。然后启动节点。调整配置前，暂停领单并等待在途工单交回。关闭浏览器可以在启动进程存续期间继续制作。
 
 开发目录中可用 `uv run --locked python -m film_worker launch` 打开带更新功能的面板，也可用 `uv run --locked python -m film_worker run` 直接启动执行服务。机器 Token 保存在 macOS 钥匙串或 Windows 凭据管理器，部署脚本也可通过 `FILM_WORKER_TOKEN` 注入。Codex 的登录和模型服务凭证保存在本机 Codex 配置中。
 
-机器接口见 `contract.openapi.yaml`。正式环境使用 HTTPS。与本机模拟服务器联调时，可以在子命令前加 `--test-http`。模型、推理强度、工作流和程序提交由制作档案锁定，节点注册仅公布本机可兑现的档案。
+机器接口见 `contract.openapi.yaml`。Mac 与 Windows 使用同一套锁定源码构建 FFmpeg；领同一制作档案还需使用相符的 Blender、Codex CLI、解码器及执行端版本。不匹配时面板显示要求值和本机值。正式环境使用 HTTPS。与本机模拟服务器联调时，可以在子命令前加 `--test-http`。模型、推理强度、工作流和程序提交由制作档案锁定，节点注册仅公布本机可兑现的档案。
 
 ## Git 更新
 
@@ -23,7 +23,7 @@
 
 ## 制作安装包
 
-先提交源码，再运行 `uv run --locked python scripts/build_portable.py --target macos-arm64` 或 `--target windows-x86_64`。压缩包和 SHA-256 文件生成于 `dist/`。构建器用 `uv.lock` 校验各平台的 wheels。可通过 `--tools` 随包携带有权分发的 Codex、Blender 或 FFmpeg，工具目录须含 `components.json`，列出各工具版本、来源和许可证。首次启动安装到数据目录后，两种操作系统都能复用已有工具缓存。[uv 锁定依赖与同步](https://docs.astral.sh/uv/concepts/projects/sync/)
+先提交源码。在 Mac 上按目标运行 `uv run --locked python scripts/build_media_tools.py --target macos-arm64` 或 `--target windows-x86_64`，然后运行 `uv run --locked python scripts/build_portable.py --target <目标> --tools dist/media-tools/<目标>`。压缩包和 SHA-256 文件生成于 `dist/`。构建器用 `uv.lock` 校验各平台的 wheels。可通过 `--tools` 随包携带有权分发的 Codex、Blender 或 FFmpeg，工具目录须含 `components.json`，列出各工具版本、来源和许可证。首次启动安装到数据目录后，两种操作系统都能复用已有工具缓存。随包媒体工具使用 FFmpeg 9.0.2 与 zlib 1.4 的锁定源码，源码和许可证一并保存在包内。[FFmpeg 源码](https://ffmpeg.org/releases/) · [zlib](https://zlib.net/) · [Windows 交叉工具链](https://github.com/mstorsjo/llvm-mingw/releases/tag/20261117) · [uv 锁定依赖与同步](https://docs.astral.sh/uv/concepts/projects/sync/)
 
 ## 验证
 
@@ -31,7 +31,7 @@
 
 模拟服务测试包括双槽位隔离、单单停止、续租重启和同版本重领。重领时核对冻结输入、运行版本和每个输出文件的 SHA-256，再通过新租约上传。文件损坏会重新生成。资格确认和分块回传都使用当前租约。
 
-在目标系统运行 `uv run --locked python scripts/verify_portable.py <安装包路径>` 可检查安装包摘要、离线安装、重复启动复用和本机面板。GitHub Actions 配置包含原生 Apple Silicon Mac 和 Windows x64 两套运行环境，可在接入 Git 仓库时执行同一验收。[运行器架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+在目标系统运行 `uv run --locked python scripts/verify_portable.py <安装包路径>` 可检查安装包摘要、离线安装、重复启动复用、随包媒体工具和本机面板。GitHub Actions 配置包含原生 Apple Silicon Mac 和 Windows x64 两套运行环境，由 Mac 构建同一源码提交的两套安装包，再分别下载到原生系统运行验收。[运行器架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 
 
 ## 附件里的验收要求

@@ -19,7 +19,7 @@ async function api(path, body) {
   return data;
 }
 
-const stateNames = {connected: "服务已连接", stopped: "未运行", connecting: "正在连接", network_unavailable: "网络不可用"};
+const stateNames = {connected: "服务已连接", stopped: "未运行", connecting: "正在连接", network_unavailable: "网络不可用", configuration_error: "配置需处理"};
 const stages = {download: "正在下载输入", codex_author: "Codex 制作", prepare_source: "抽取原片帧", compare_review: "生成对比图", verify_review: "核对审核签名"};
 
 async function refresh() {
@@ -27,7 +27,7 @@ async function refresh() {
     const state = await api("status");
     const badge = document.querySelector("#connection");
     badge.textContent = stateNames[state.connection] ?? state.connection;
-    if (state.detail) badge.title = state.detail;
+    badge.title = state.detail ?? "";
     badge.dataset.online = state.connection === "connected";
     const release = state.release;
     document.querySelector("#update-status").textContent = release ?
@@ -35,7 +35,8 @@ async function refresh() {
     document.querySelector('[data-control="rollback"]').disabled = !state.managed || !state.rollback_available;
     document.querySelector('[data-control="update"]').disabled = !state.managed;
     const counts = state.slots ? `${state.active.length} / ${state.slots} 个槽位 · 剩余 ${state.free_gib} GiB` : "节点待启动";
-    document.querySelector("#capacity").textContent = counts + (state.draining ? " · 暂停领单" : "");
+    document.querySelector("#capacity").textContent = counts + (state.draining ? " · 暂停领单" : "") +
+      (state.detail ? " · " + state.detail : "");
     const list = document.querySelector("#jobs");
     const rows = state.active.map(job => {
       const row = document.createElement("li");

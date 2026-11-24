@@ -197,7 +197,11 @@ def registration(config, instance_id, versions):
     all_profiles = config["profiles"]
     profiles = [p for p in all_profiles if profile_matches(p, versions)]
     if not profiles:
-        raise ValueError("没有与本机工具版本匹配的制作档案")
+        if not all_profiles:
+            raise ValueError("尚未保存管理端签发的制作档案")
+        first = all_profiles[0]["compatibility"]
+        fields = [f"{name} 要求 {first[name]}，本机 {value}" for name,value in versions.items() if first[name] != value]
+        raise ValueError("制作档案不匹配 · " + "；".join(fields))
     opaque(config["node_key"])
     env = environment(config, versions, profiles[0])
     available = sorted({"cpu", env["render_backend"]})

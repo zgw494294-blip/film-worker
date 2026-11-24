@@ -389,7 +389,7 @@ class Production:
         self.progress("verify_technical")
         quality.media_report(delivery / "meta/video-technical.jsonl", self.order.get("sample_id", self.order["job_id"]),
                              [("source_video", original), ("white_video", white_path), ("comparison_video", compare_path)],
-                             ffmpeg=self.tools["ffmpeg"], formal=quality.policy(self.profile) == "human_required")
+                             formal=quality.policy(self.profile) == "human_required")
         index = dict(schema_version=1, job_id=self.order["job_id"], version=self.order["target_version"],
                      version_manifest_sha256=digest(self.sources["version_manifest"]),
                      approval_manifest_sha256=digest(self.sources["approval_manifest"]),

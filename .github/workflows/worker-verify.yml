@@ -7,8 +7,32 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  build-distribution:
     timeout-minutes: 25
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [macos-arm64, windows-x86_64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install uv==0.13.7
+      - run: uv run --locked python scripts/build_media_tools.py --target ${{ matrix.target }}
+      - run: uv run --locked python scripts/build_portable.py --target ${{ matrix.target }} --tools dist/media-tools/${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: worker-${{ matrix.target }}
+          path: dist/电影复刻执行端-${{ matrix.target }}.zip*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  verify:
+    needs: build-distribution
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -28,7 +52,9 @@ jobs:
         env:
           FILM_WORKER_TEST_RELEASE: "1"
         run: uv run --locked python -m unittest discover -s tests -v
-      - name: Build local platform distribution
-        run: uv run --locked python scripts/build_portable.py --target ${{ matrix.target }}
-      - name: Install twice with offline resolution and exercise the installed panel
+      - uses: actions/download-artifact@v8
+        with:
+          name: worker-${{ matrix.target }}
+          path: dist
+      - name: Exercise offline installation, media tools, and the installed panel
         run: uv run --locked python scripts/verify_portable.py "dist/电影复刻执行端-${{ matrix.target }}.zip"

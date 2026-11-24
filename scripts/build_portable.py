@@ -148,11 +148,15 @@ def bundle(args):
                                        capture_output=True, text=True).stdout.strip()
         (runtime/"build.json").write_text(json.dumps({"commit":active_commit}), encoding="utf-8")
         if args.tools:
-            # Optional release-owned binaries must bring their versions, origin and licences.
             if not (args.tools / "components.json").is_file():
                 raise ValueError("工具目录须提供 components.json")
-            origin.extend(json.loads((args.tools/"components.json").read_text(encoding="utf-8")))
-            shutil.copytree(args.tools, runtime/"tools")
+            components = json.loads((args.tools/"components.json").read_text(encoding="utf-8"))
+            for component in components:
+                for name, checksum in component.get("binaries", {}).items():
+                    if PurePosixPath(name).name != name or "\\" in name or sha(args.tools/name) != checksum:
+                        raise ValueError(f"随包工具与构建清单不符 {name}")
+            origin.extend(components)
+            shutil.copytree(args.tools, runtime/"tools",ignore=shutil.ignore_patterns("._*", ".DS_Store", "__pycache__"))
         manifest = {"target": target, "schema": 1, "components": origin, "files": file_records(runtime)}
         (runtime / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         output = args.output / f"电影复刻执行端-{target}.zip"

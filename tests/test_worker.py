@@ -16,6 +16,7 @@ from pathlib import Path
 from film_worker import bundles, production, quality
 from film_worker.processes import ProcessTree
 from film_worker.protocol import Client, Transfer
+from film_worker.settings import DEFAULTS, object_hash, registration
 from film_worker.state import State
 
 
@@ -190,6 +191,13 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(len(state.rows(True)), 1)
             self.assertEqual(json.loads(state.rows(True)[0]["pending"]), {"outputs": ["fixture"]})
 
+    def test_incompatible_media_tool_build_names_the_exact_difference(self):
+        profile = {"compatibility":{"ffmpeg":"9.0.2"}, "codex_model":"fixture",
+                   "codex_provider":"fixture", "reasoning_effort":"medium"}
+        profile["profile_hash"] = object_hash(profile)
+        with self.assertRaisesRegex(ValueError,"ffmpeg 要求 9.0.2，本机 8.1"):
+            registration({**DEFAULTS,"profiles":[profile]}, "fixture", {"ffmpeg":"8.1"})
+
     def test_formal_batch_prohibits_automatic_authoring(self):
         profile = {"production_policy": "human_required"}
         self.assertFalse(quality.may_author(profile, "prepare"))
@@ -204,7 +212,7 @@ class ArtifactTests(unittest.TestCase):
             subprocess.run(["ffmpeg","-v","error","-f","lavfi","-i","color=white:size=128x72:rate=24",
                             "-frames:v","3","-vf","drawbox=t=fill:c=black:enable='eq(n,2)'",
                             "-c:v","libx264",str(path)], check=True)
-            data = quality.read_video("white_video", path, ffmpeg="ffmpeg", scan_black=True)
+            data = quality.read_video("white_video", path, scan_black=True)
             self.assertEqual(data["black_frames"], [3])
             self.assertEqual(data["black_tail_frames"], [3])
 
