@@ -1,0 +1,87 @@
+"""Production guidance and verifiable media acceptance checks."""
+import json
+import re
+import subprocess
+from fractions import Fraction
+
+from . import intake
+
+
+REVIEW_CHECKLIST = """逐镜回看。按源帧核对以下十类缺陷，返修时同时检查本段、相邻帧和全片同类问题。
+1. 比例与尺度。按门窗、道具和其他人物核对头身比、四肢长度和物体体量。
+2. 透视与视角。核对消失点、地平线、俯仰、焦距、运镜种类和镜头加减速。
+3. 空间对位。对齐主角和关键物体的投影轮廓、中心、落点、边界和前后层次。
+4. 模型结构。应影响透视、接触或遮挡的门窗、家具和结构必须补齐；部件完整且连接正确。
+5. 穿模。检查角色与地板、墙、道具和其他角色的非预期相交。
+6. 姿态与动作。核对朝向、肩颈、重心、步态、脚掌落地、手指与道具的实际接触。
+7. 动画时序。检查手部和关节抽搐、卡顿、步速错位及片尾动作提前停止。
+8. 渲染闪烁与抖动。检查静态背景、门框、灯光、边缘及亮度跳变。
+9. 时序连续性。切镜、遮挡和出入画时机要一致；核对物体和人是否突然出现或消失。
+10. 色彩区分。同一角色跨镜保持颜色，多角色、道具与场景可区分，按素材包色板。
+重点查看每次切镜、接触、遮挡、出入画以及末尾一秒，检查黑帧、空镜、无关音画。
+若原片难以识别、误差过大或暂时不能修复，在制作记录标出帧段及原因，由人工核对。
+"""
+
+
+def policy(profile):
+    return profile.get("production_policy", "codex_trial")
+
+
+def may_author(profile, kind):
+    return policy(profile) != "human_required" or kind == "finalize"
+
+
+def read_video(role, path, *, ffmpeg, scan_black=False):
+    raw, video, pts, time_base, duration, _ = intake.measure(path)
+    tracks = [stream for stream in raw["streams"] if stream["codec_type"] == "audio"]
+    black_frames = []
+    if scan_black:
+        threshold = 5 if video.get("color_range") in {"pc", "jpeg"} else 21
+        command = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "info", "-i", str(path),
+                   "-vf", f"blackframe=amount=100:threshold={threshold}", "-an", "-f", "null", "-"]
+        proc = subprocess.run(command, capture_output=True, text=True, errors="replace", check=True)
+        black_indices = [int(x)+1 for x in re.findall(r"\[Parsed_blackframe[^\]]*\]\s+frame:\s*(\d+)", proc.stderr)]
+        black_frames = [i for i in black_indices if i <= len(pts)]
+    starts = [tick-pts[0] for tick in pts]
+    start_of_last_second = max(Fraction(0), duration-1)
+    tail = [i for i in black_frames if (starts[i] if i < len(starts) else duration/time_base)*time_base >
+            start_of_last_second]
+    fmt = raw["format"]["format_name"]
+    return dict(role=role, container=fmt, codec=video["codec_name"],
+                width=video["width"], height=video["height"], duration_seconds=str(duration),
+                frame_count=len(pts), average_fps=str(len(pts)/duration), time_base=str(time_base),
+                variable_rate=len(set(b-a for a,b in zip(starts, starts[1:]+[int(duration/time_base)]))) > 1,
+                bitrate=int(video.get("bit_rate") or 0), black_frames=black_frames, black_tail_frames=tail,
+                audio=[dict(codec=s["codec_name"], channels=s.get("channels"), sample_rate=int(s.get("sample_rate") or 0),
+                            bitrate=int(s.get("bit_rate") or 0), sample_format=s.get("sample_fmt"))
+                       for s in tracks])
+
+
+def validate_formal(record):
+    if (record["width"] < record["height"] or min(record["width"],record["height"]) < 1080 or
+            Fraction(record["average_fps"]) < 24 or not 15 <= Fraction(record["duration_seconds"]) <= 40 or
+            "mp4" not in record["container"].split(",") or record["codec"] not in {"h264","hevc"}):
+        raise ValueError(f"{record['role']} 未达到正式批次的横幅、分辨率、时长、帧率或编码要求")
+
+
+def media_report(path, sample_id, files, *, ffmpeg, formal):
+    """Save three technical JSONL rows and fail if generated outputs contain black frames."""
+    rows = []
+    for role, file in files:
+        data = read_video(role, file, ffmpeg=ffmpeg, scan_black=role != "source_video" or formal)
+        data.update(sample_id=sample_id, file=file.relative_to(path.parent.parent).as_posix())
+        if role != "source_video" and data["audio"]:
+            data["audio_target_bitrate"] = 320_000
+        if formal:
+            if role != "comparison_video":
+                validate_formal(data)
+            if role == "source_video" and file.suffix.lower() != ".mp4":
+                raise ValueError("正式批次原片须为 MP4")
+        rows.append(data)
+    with path.open("w", encoding="utf-8", newline="\n") as out:
+        for row in rows:
+            out.write(json.dumps(row, ensure_ascii=False)+"\n")
+    for row in rows:
+        if row["black_frames"]:
+            suffix = f"，片尾最后一秒 {row['black_tail_frames'][:10]}" if row["black_tail_frames"] else ""
+            raise ValueError(f"{row['role']} 存在黑帧 {row['black_frames'][:10]}{suffix}")

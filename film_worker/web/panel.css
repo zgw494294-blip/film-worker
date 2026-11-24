@@ -1,0 +1,36 @@
+:root { color-scheme: dark; font: 15px/1.5 Inter, "PingFang SC", "Microsoft YaHei", sans-serif; background: #13161b; color: #ebedf1; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1020px; margin: auto; padding: 40px 24px; }
+header, .row, footer { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+header { margin-bottom: 22px; }
+h1 { margin: 0; font-size: 28px; letter-spacing: .02em; }
+h2 { margin: 0; font-size: 19px; }
+p { color: #bac3cf; margin: 4px 0 10px; }
+section, form { padding: 19px; margin-bottom: 17px; background: #1c2028; border: 1px solid #343c4a; border-radius: 12px; }
+#connection { border: 1px solid #434c5c; border-radius: 30px; padding: 5px 10px; }
+#connection[data-online=true] { color: #9be4bf; border-color: #367c55; }
+.actions { display: flex; gap: 7px; flex-wrap: wrap; }
+button, input, select, textarea { font: inherit; color: inherit; border: 1px solid #465167; border-radius: 6px; background: #222a36; }
+button { padding: 6px 12px; cursor: pointer; }
+button:hover { background: #33415a; }
+button[type=submit] { background: #9fd6fe; color: #14202e; font-weight: 600; }
+input, select, textarea { width: 100%; padding: 6px 9px; }
+label { display: grid; gap: 4px; color: #d5dce8; }
+fieldset { border: 0; margin: 15px 0; padding: 0; }
+legend, summary { margin-bottom: 9px; font-weight: 650; }
+.grid { display: grid; gap: 12px 14px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+details { margin: 16px 0; border-top: 1px solid #343c4a; padding-top: 12px; }
+summary { cursor: pointer; }
+textarea, #notice { overflow-wrap: anywhere; }
+textarea { resize: vertical; font-family: ui-monospace, monospace; }
+#jobs { list-style: none; padding: 0; margin: 0; }
+#jobs li { display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid #343c4a; padding: 9px 0; }
+#notice { white-space: pre-wrap; color: #b4d9ff; }
+#notice[data-error=true] { color: #ffb2a9; }
+
+.toggle { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
+.toggle input { width: auto; }
+
+.model { margin: 12px 0; }
+#draft-model { margin-bottom: 10px; }

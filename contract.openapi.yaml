@@ -1,0 +1,2678 @@
+openapi: 3.1.0
+info:
+  title: 电影复刻 · 建模执行端接口
+  version: 1.0.0
+  description: '公网管理端提供的 HTTPS 出站拉取协议。服务端权威保存作业、版本、审批、工件和交付。建模节点只需访问一个管理端地址，以节点令牌领取、续租、上报和回传。节点合同与管理端 UI 用户接口独立。
+
+    建模执行端运行在 Mac 上。下列标识、角色、路径、状态、哈希算法及字节范围用于管理端与各台 Mac 之间互操作。工件清单中的 JSON 是 UTF-8 文件；普通工件哈希针对实际文件字节，明确标有 JCS 的字段才对规范化 JSON 计算哈希。HTTP
+    时间均为带时区的 RFC 3339。'
+servers:
+- url: https://{host}/api/v1
+  variables:
+    host:
+      default: workbench.example.com
+      description: 部署时替换为管理端证书对应的域名（可以含 HTTPS 端口）。
+security:
+- ModelingBearer: []
+tags:
+- name: 节点
+- name: 工作
+- name: 工件
+x-operational-contract:
+  授权: 建模令牌由管理端预发或轮换，一枚令牌绑定一个 node_key。所有操作验证 Bearer 和节点/工作归属。节点侧供应商及模型登录由节点自己配置，不随建模令牌、能力快照、事件、日志或工件上传。撤销令牌应立即拒绝新请求。
+  租约: attempt 对同一工作从 1 递增，重分派同时提升 fence，撤销旧租约。节点自身的并发上限由 slots 提示并由服务端原子限制。管理端时间为准，服务端对持租写验核 worker、lease_id、fence、attempt、终态与控制状态；上报进度、传分段、上传完成均不自动续租。工作心跳与长任务、上传并行执行。发生状态冲突后节点查询
+    status，再处置本地缓存。
+  重放: Idempotency-Key 的记录以令牌稳定主体、操作/目标资源和幂等键隔离，保留原响应及请求哈希。请求摘要是规范化正文以及资源/相关租约头的不可变身份摘要。相同键同内容复用原响应，不同内容返回 409。Complete
+    的事务回执与 work、版本或交付记录共同持久保存；丢失响应必须在本地保留原字节/键/租约元组，同键重试或 GET status 查证。续租及查询无需幂等键。PUT part 以会话+序号+范围+摘要幂等。
+  正式批次: 档案 production_policy=human_required 时，服务端应将首制和返修交给人工制作流程；节点只在已审核基版明确标识 production_method=human 时执行正式出片。交付包 meta/video-technical.jsonl 记录同一 sample_id 下的三路媒体技术检查与黑帧结果。
+  人工审核: |-
+    prepare/revise 的 complete 原子发布一个可审核版本（review）。管理端在第一次人工领取时绑定该作业的 original_annotator_id。所有返修版的复核、逐帧通过、圈选、提交意见和已交付版的补充标注都只授权这个原标注员账号，管理员与其他标注员不能转派或代审。原账号暂不可用时保留给其本人处理。
+    服务端只有在当前版全部帧通过后才冻结完整 approval_manifest 并排入 finalize。finalize 核验后关联既有批准版本并发布交付（done）。返修制作可以重新分派到另一台具备相同所需能力和 profile 的制作节点；领取制作工单不会改变原标注员，机器令牌没有人工审核权限。
+  出片校验: finalize 在兼容的锁定环境重新校验原片/时间线/工程、review_bundle 逐帧无损素材、审批签名和输出配置。审片尺寸等于交付尺寸时可从已审无损白模帧编码；否则从已核验的同一工程、时间线和渲染配置按交付尺寸逐帧渲染，验证时序、输出画幅、完整性与所选
+    profile 的画面一致性条件。不得直接放大审片 JPEG 作为白模。变更工程或媒体身份应回到审核流程。
+  归档核验: 入库时管理端以有界缓冲逐件核验 ZIP 中央目录与实际数据，拒绝绝对路径、盘符、反斜线、上跳、空段、NUL、重复规范化路径、大小写/Unicode 碰撞、符号/硬链接、特殊文件及加密条目；限制解压总字节/条目数与压缩比。以规范相对路径将实际文件与索引逐一核对大小和
+    SHA-256，拒绝多余、缺少、重名及引用越界内容。工件暂存成功不代表送审或交付成功。
+  管理控制: pause/stop/delete 由管理端下发，执行端无相应控制写接口。pause 将任务置 paused 并收回租约，可由管理端恢复到 queued；stop/deleted 为终止。删除保留最小
+    tombstone 使断线节点能够确认清理。若完成提交与控制竞态，以管理端锁内先提交的事务为准。暂存可回收，已经发布的版本和回执按数据保留策略管理。
+  错误与重试: 令牌无效或权限错误须纠正配置。409 lease_lost/control_changed 后立刻停止旧租约写，查询状态；409 not_ready 可补齐上传。422 须定位签名/格式/配置，不能反复提交同一错误内容。429/503
+    与网络超时按 Retry-After 或指数退避加抖动；轮询无法连接时退避，达到 lease 截止点后停写，待重领。删除终态的状态响应不暴露媒体。
+x-artifact-contract:
+  source_video: 上传原片原始字节
+  rules_bundle: 固定批次规则与验收资料归档
+  workflow_bundle: 固定工作流程与工程资源归档
+  source_timeline:
+    $ref: '#/components/schemas/Timeline'
+  scene_bundle:
+    $ref: '#/components/schemas/SceneBundleIndex'
+  shot_metadata:
+    $ref: '#/components/schemas/ShotMetadata'
+  review_bundle:
+    $ref: '#/components/schemas/ReviewBundleIndex'
+  version_manifest:
+    $ref: '#/components/schemas/VersionManifest'
+  feedback_manifest:
+    $ref: '#/components/schemas/FeedbackManifest'
+  approval_manifest:
+    $ref: '#/components/schemas/ApprovalManifest'
+  production_report: UTF-8 Markdown 制作记录；记录本轮处理内容、约束、实际环境和核验结果。
+  white_video: 最终白模 MP4；单幅交付尺寸、原片时间线与规定同期声。
+  comparison_video: 最终上下对比 MP4；宽度为单幅宽度，高度为单幅交付高度两倍。
+  delivery_bundle:
+    $ref: '#/components/schemas/DeliveryIndex'
+paths:
+  /workers/register:
+    post:
+      operationId: registerWorker
+      tags:
+      - 节点
+      summary: 注册建模节点
+      description: 使用管理端预发的、绑定 node_key 的建模令牌注册或恢复 Mac 节点。服务端校验 capabilities.environment.os 为 macOS 及版本号，其他系统返回 422/profile_mismatch。并发启动按 instance_id 和节点容量仲裁。该接口不签发模型服务密钥。
+      parameters:
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Register'
+            example:
+              node_key: node_mac_1
+              instance_id: ad237523-7042-4c58-95c1-161dae4e980b
+              capabilities:
+                work_kinds:
+                - prepare
+                - revise
+                - finalize
+                profile_hashes:
+                - '0000000000000000000000000000000000000000000000000000000000000000'
+                slots: 1
+                max_frame_width: 3840
+                render_backends:
+                - METAL
+                environment:
+                  os: macOS 15.7
+                  arch: arm64
+                  gpu: Apple GPU
+                  render_backend: METAL
+                  compatibility:
+                    runner_commit: '1111111111111111111111111111111111111111'
+                    decoder_id: rgb8-pillow13-av19/1
+                    blender: 5.2.3
+                    ffmpeg: '8.0'
+                    codex_cli: pinned-build-1
+                    workflow_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+                    rules_sha256: '3333333333333333333333333333333333333333333333333333333333333333'
+                  codex_provider: node-local
+                  codex_model: gpt-6.2-astra
+                  reasoning_effort: max
+                  model_evidence: configured
+      responses:
+        '200':
+          description: 已注册，领取参数由服务端返回。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerSession'
+              example:
+                worker_id: worker_mac_1
+                server_time: '2026-11-24T03:00:00Z'
+                heartbeat_seconds: 30
+                claim_wait_max_seconds: 25
+                lease_seconds: 90
+                lease_heartbeat_seconds: 20
+                part_size_bytes: 8388608
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /workers/{worker_id}/heartbeat:
+    post:
+      operationId: workerHeartbeat
+      tags:
+      - 节点
+      summary: 报告节点可用性
+      description: 建议每 30 秒发送一次；重复报告是同一节点状态快照，不产生工作或副作用。
+      parameters:
+      - $ref: '#/components/parameters/WorkerID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkerHeartbeat'
+      responses:
+        '200':
+          description: 接收当前状态。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerHeartbeatAck'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /work/claim:
+    post:
+      operationId: claimWork
+      tags:
+      - 工作
+      summary: 按可用能力长轮询领取
+      description: 推荐 wait_seconds=25。服务端只分派兼容 profile 的工作并原子签出租约。只要上次领取结果不明，重试同一个键；204 后本次轮询结束，等待 Retry-After
+        秒并用新键轮询。
+      parameters:
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Claim'
+            example:
+              worker_id: worker_mac_1
+              instance_id: ad237523-7042-4c58-95c1-161dae4e980b
+              wait_seconds: 25
+              work_kinds:
+              - revise
+              - finalize
+      responses:
+        '200':
+          description: 获得一项工作；持久化 work_id、attempt、fence 及 lease_id 后再执行。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assignment'
+        '204':
+          description: 暂无适配工作或无剩余插槽。无响应正文。
+          headers:
+            Retry-After:
+              description: 空队列默认 3 秒，可增加少量随机抖动。
+              schema:
+                type: integer
+                minimum: 1
+                default: 3
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /work/{work_id}/heartbeat:
+    post:
+      operationId: workHeartbeat
+      tags:
+      - 工作
+      summary: 续租并拉取控制指令
+      description: 每 20 秒续期，服务端从受理时起保留 90 秒。心跳超时优先重试；本地超过已知租期且无法确认时停止处理和写入。409 带控制或过期错误，再调用终态查询。
+      parameters:
+      - $ref: '#/components/parameters/WorkID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkHeartbeat'
+            example:
+              stage: render_review
+              completed: 23
+              total: 130
+      responses:
+        '200':
+          description: 控制或续租结果。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Control'
+              example:
+                directive: continue
+                server_time: '2026-11-24T03:05:00Z'
+                expires_at: '2026-11-24T03:06:30Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /work/{work_id}/events:
+    post:
+      operationId: appendEvents
+      tags:
+      - 工作
+      summary: 提交有序进度与日志
+      description: 批内按 sequence 递增；预期下一个序号不连续时拒绝新事件，同一键同一内容重放原回执。
+      parameters:
+      - $ref: '#/components/parameters/WorkID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBatch'
+      responses:
+        '200':
+          description: 已持久化的连续序号。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventAck'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /work/{work_id}/uploads:
+    post:
+      operationId: beginUpload
+      tags:
+      - 工件
+      summary: 创建分段上传
+      description: 在当前租约和工作内创建临时上传。重复幂等请求返回同一 upload_id。必须先完成上传，再在 complete 中引用工件。
+      parameters:
+      - $ref: '#/components/parameters/WorkID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeginUpload'
+            example:
+              role: review_bundle
+              size_bytes: 12582912
+              sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+              media_type: application/zip
+      responses:
+        '201':
+          description: 创建上传会话；分段可以并行或重传。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /uploads/{upload_id}:
+    get:
+      operationId: getUpload
+      tags:
+      - 工件
+      summary: 查询已收分段
+      description: 只允许上传会话所属的有效租约。返回分段范围与哈希供本地核对，无需重复传输已存在的分段。
+      parameters:
+      - $ref: '#/components/parameters/UploadID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      responses:
+        '200':
+          description: 上传会话快照。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /uploads/{upload_id}/parts/{part_no}:
+    put:
+      operationId: putPart
+      tags:
+      - 工件
+      summary: 写入一个固定范围的数据段
+      description: 一段一请求；上传体为原始二进制。相同 upload_id、part_no、范围与 SHA 重发返回 204；同一分段内容冲突返回 409，越界或长度错误 416，摘要错误 422。
+      parameters:
+      - $ref: '#/components/parameters/UploadID'
+      - $ref: '#/components/parameters/PartNo'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/ContentRange'
+      - $ref: '#/components/parameters/PartSHA'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '204':
+          description: 分段校验成功，重复写同一段也返回此结果。
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '416':
+          $ref: '#/components/responses/Range'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /uploads/{upload_id}/complete:
+    post:
+      operationId: sealUpload
+      tags:
+      - 工件
+      summary: 合并并校验完整工件
+      description: 必须连续收到所有分段。服务端复算整体 SHA-256；不完整返回 409/not_ready；校验失败返回 422/hash_mismatch。封存后禁止修改。
+      parameters:
+      - $ref: '#/components/parameters/UploadID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SealUpload'
+      responses:
+        '200':
+          description: 已校验的不可变工件引用，暂未发布版本。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /artifacts/{artifact_id}/content:
+    get:
+      operationId: downloadArtifact
+      tags:
+      - 工件
+      summary: 下载当前输入清单允许的工件
+      description: 令牌主体须是 work_id 的当前持租者；只允许下载当前 input_manifest 显式列出的工件。不可遍历同作业其他工件。整件与分段完成后按清单 SHA-256 校验。
+      parameters:
+      - $ref: '#/components/parameters/ArtifactID'
+      - $ref: '#/components/parameters/ScopeWork'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Range'
+      - $ref: '#/components/parameters/IfRange'
+      responses:
+        '200':
+          description: 整件二进制。
+          headers:
+            ETag:
+              description: 强 ETag，值为双引号包裹的工件 sha256。
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                const: bytes
+            Content-Length:
+              schema:
+                type: integer
+                minimum: 0
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: 满足 Range 的字节。
+          headers:
+            ETag:
+              description: 强 ETag，值为双引号包裹的工件 sha256。
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                const: bytes
+            Content-Length:
+              schema:
+                type: integer
+                minimum: 0
+            Content-Range:
+              required: true
+              schema:
+                type: string
+              description: bytes start-end/total
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '416':
+          $ref: '#/components/responses/Range'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /work/{work_id}/complete:
+    post:
+      operationId: completeWork
+      tags:
+      - 工作
+      summary: 提交并原子发布一次工作结果
+      description: 鉴权后首先查询此节点、work_id、操作和幂等键的已提交回执；摘要（包括原 lease/fence/attempt 和规范化正文）一致即返回原 200，即使租约已过期或工作已结束。相同键异摘要返回
+        409/idempotency_conflict。未命中才校验当前租约、状态、控制、profile、输入与输出，并在同一事务提交工件引用、新版本或交付、工作状态及幂等回执。禁止新键或迟到 attempt
+        创建重复版本。
+      parameters:
+      - $ref: '#/components/parameters/WorkID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Complete'
+            example:
+              input_manifest_sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+              profile_hash: '4444444444444444444444444444444444444444444444444444444444444444'
+              environment:
+                os: macOS 15.7
+                arch: arm64
+                gpu: Apple GPU
+                render_backend: METAL
+                compatibility:
+                  runner_commit: '1111111111111111111111111111111111111111'
+                  decoder_id: rgb8-pillow13-av19/1
+                  blender: 5.2.3
+                  ffmpeg: '8.0'
+                  codex_cli: pinned-build-1
+                  workflow_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+                  rules_sha256: '3333333333333333333333333333333333333333333333333333333333333333'
+                codex_provider: node-local
+                codex_model: gpt-6.2-astra
+                reasoning_effort: max
+                model_evidence: inherited
+              outputs:
+              - artifact_id: a_1
+                role: white_video
+                sha256: '1111111111111111111111111111111111111111111111111111111111111111'
+                size_bytes: 1000
+                media_type: video/mp4
+              - artifact_id: a_2
+                role: comparison_video
+                sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+                size_bytes: 1000
+                media_type: video/mp4
+              - artifact_id: a_3
+                role: delivery_bundle
+                sha256: '3333333333333333333333333333333333333333333333333333333333333333'
+                size_bytes: 1000
+                media_type: application/zip
+              final_verification:
+                version_manifest_sha256: '5555555555555555555555555555555555555555555555555555555555555555'
+                approval_manifest_sha256: '6666666666666666666666666666666666666666666666666666666666666666'
+                timeline_sha256: '7777777777777777777777777777777777777777777777777777777777777777'
+                scene_sha256: '8888888888888888888888888888888888888888888888888888888888888888'
+                frame_count: 130
+                verified_review_frames: 130
+                white_frame_count: 130
+                comparison_frame_count: 130
+                white_size:
+                  width: 3840
+                  height: 2154
+                comparison_size:
+                  width: 3840
+                  height: 4308
+                pts_verified: true
+                audio_verified: true
+                render_source: locked_scene_native_render
+      responses:
+        '200':
+          description: 已发布或同一次提交的回执重放。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receipt'
+              example:
+                receipt_id: rc_42
+                job_id: j_1
+                work_id: w_42
+                attempt: 2
+                kind: finalize
+                state: succeeded
+                version: 2
+                committed_at: '2026-11-24T03:20:00Z'
+                artifacts:
+                - artifact_id: a_1
+                  role: white_video
+                  sha256: '1111111111111111111111111111111111111111111111111111111111111111'
+                  size_bytes: 1000
+                  media_type: video/mp4
+                - artifact_id: a_2
+                  role: comparison_video
+                  sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+                  size_bytes: 1000
+                  media_type: video/mp4
+                - artifact_id: a_3
+                  role: delivery_bundle
+                  sha256: '3333333333333333333333333333333333333333333333333333333333333333'
+                  size_bytes: 1000
+                  media_type: application/zip
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /work/{work_id}/fail:
+    post:
+      operationId: failWork
+      tags:
+      - 工作
+      summary: 报告本次尝试失败
+      description: 记录本次尝试的终结并释放租约。相同键重放已受理回执；服务端选择新 attempt 重排或置终止。节点不得通过 fail 自行恢复已停止、删除的任务。
+      parameters:
+      - $ref: '#/components/parameters/WorkID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Failure'
+            example:
+              code: disk_full
+              message: 节点临时目录空间不足
+              retryable: true
+      responses:
+        '200':
+          description: 服务端的排队或终止决定。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /jobs/{job_id}/status:
+    get:
+      operationId: readWorkTerminalStatus
+      tags:
+      - 工作
+      summary: 查询终态及回执
+      description: work_id 必填且与节点领取记录匹配；查询无需有效租约。未关联工作返回 404，已删除作业保留最小 tombstone 后返回 directive=delete、job_state=deleted；节点据此清理本地缓存。返回成功回执可辅助解决完成响应遗失。
+      parameters:
+      - $ref: '#/components/parameters/JobID'
+      - $ref: '#/components/parameters/ScopeWork'
+      responses:
+        '200':
+          description: 当前作业、所查工作项与控制状态。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/Missing'
+        '429':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+components:
+  securitySchemes:
+    ModelingBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: 每个建模节点独立的管理端令牌。禁止用模型厂商凭据替代。
+  parameters:
+    WorkerID:
+      name: worker_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ID'
+      description: 注册回执中的本节点标识。
+    WorkID:
+      name: work_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ID'
+      description: 领取的工作项。
+    UploadID:
+      name: upload_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ID'
+      description: 本次暂存上传。
+    PartNo:
+      name: part_no
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+      description: 从 1 开始的分段编号。
+    ArtifactID:
+      name: artifact_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ID'
+      description: 领取清单或提交回执中的工件。
+    JobID:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ID'
+      description: 作业标识。
+    ScopeWork:
+      name: work_id
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/ID'
+      description: 本节点领取过的工作；下载上下文必须属于有效租约。
+    Idempotency:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 每次逻辑操作一个不透明键，网络重试原样复用；推荐 UUID。
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    Lease:
+      name: X-Lease-Id
+      in: header
+      required: true
+      description: 本次 claim 的 lease_id。
+      schema:
+        $ref: '#/components/schemas/ID'
+    Fence:
+      name: X-Fence
+      in: header
+      required: true
+      description: 当前 work 的单调递增写栅栏。
+      schema:
+        type: integer
+        minimum: 1
+    Attempt:
+      name: X-Attempt
+      in: header
+      required: true
+      description: 当前领取次数。
+      schema:
+        type: integer
+        minimum: 1
+    ContentRange:
+      name: Content-Range
+      in: header
+      required: true
+      description: bytes START-END/TOTAL，三项均为十进制整数；闭区间且与 part_no 匹配。
+      schema:
+        type: string
+        pattern: ^bytes [0-9]+-[0-9]+/[1-9][0-9]*$
+    PartSHA:
+      name: X-Part-SHA256
+      in: header
+      required: true
+      description: 本次 HTTP body 原始字节的 SHA-256。
+      schema:
+        $ref: '#/components/schemas/Sha256'
+    Range:
+      name: Range
+      in: header
+      schema:
+        type: string
+        pattern: ^bytes=([0-9]+-[0-9]*|-[1-9][0-9]*)$
+      description: 只接受单个 bytes 范围。
+    IfRange:
+      name: If-Range
+      in: header
+      schema:
+        type: string
+      description: 上次返回的带双引号的强 ETag。失配返回 200 整件，客户端重新开始。
+  responses:
+    BadRequest:
+      description: 400 · 请求参数或结构不合法。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthenticated:
+      description: 401 · 令牌失效，重新配置节点凭据后再请求。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: Bearer realm="modeling"
+    Forbidden:
+      description: 403 · 节点无权操作指定资源。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Missing:
+      description: 404 · 资源不存在或对调用方不可见。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: 409 · 租约失效、控制状态已变、更改幂等内容或状态冲突。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Range:
+      description: '416 · 范围不可满足。下载返回 Content-Range: bytes */对象总长。'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+      headers:
+        Content-Range:
+          schema:
+            type: string
+          description: 下载不可满足时为 bytes */size。
+    Invalid:
+      description: 422 · 哈希、索引、媒体、运行配置或输入输出清单未通过核验。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Busy:
+      description: 429 · 超出限流，遵守 Retry-After。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: 等待秒数。
+    Unavailable:
+      description: 503 · 服务暂不可用，退避并使用原幂等键重试。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: 等待秒数。
+  schemas:
+    ID:
+      type: string
+      description: 服务端生成的标识，不透明；路径编码使用该值。
+      pattern: ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$
+    Sha256:
+      type: string
+      description: 原始字节的 SHA-256，小写十六进制，共 64 位。
+      pattern: ^[a-f0-9]{64}$
+    Rational:
+      type: string
+      description: 整数字符串或有理数字符串，分母为正整数；例如 1/24000。
+      pattern: ^-?[0-9]+(/[1-9][0-9]*)?$
+    Size:
+      type: object
+      additionalProperties: false
+      required:
+      - width
+      - height
+      properties:
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+      description: 单幅画面像素尺寸；上下对比图总高是单幅的两倍。
+    WorkKind:
+      type: string
+      enum:
+      - prepare
+      - revise
+      - finalize
+    Directive:
+      type: string
+      enum:
+      - continue
+      - pause
+      - stop
+      - delete
+    WorkState:
+      type: string
+      enum:
+      - queued
+      - leased
+      - succeeded
+      - paused
+      - stopped
+      - failed
+      - deleted
+    JobState:
+      type: string
+      enum:
+      - queued
+      - running
+      - review
+      - supplement
+      - done
+      - paused
+      - stopped
+      - failed
+      - deleted
+    Role:
+      type: string
+      enum:
+      - source_video
+      - rules_bundle
+      - workflow_bundle
+      - source_timeline
+      - scene_bundle
+      - shot_metadata
+      - review_bundle
+      - version_manifest
+      - feedback_manifest
+      - approval_manifest
+      - production_report
+      - white_video
+      - comparison_video
+      - delivery_bundle
+    Artifact:
+      type: object
+      additionalProperties: false
+      required:
+      - artifact_id
+      - role
+      - sha256
+      - size_bytes
+      - media_type
+      properties:
+        artifact_id:
+          $ref: '#/components/schemas/ID'
+        role:
+          $ref: '#/components/schemas/Role'
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+        size_bytes:
+          type: integer
+          minimum: 1
+        media_type:
+          type: string
+          minLength: 1
+      description: 不可变对象。GET /artifacts/{artifact_id}/content 的路径只从返回的 ID 构造；不接受执行节点提供的公网下载地址。
+    Compatibility:
+      type: object
+      additionalProperties: false
+      required:
+      - runner_commit
+      - decoder_id
+      - blender
+      - ffmpeg
+      - codex_cli
+      - workflow_sha256
+      - rules_sha256
+      properties:
+        runner_commit:
+          type: string
+          description: 执行器发布构建的 Git 完整提交。
+          pattern: ^([0-9a-f]{40}|[0-9a-f]{64})$
+        decoder_id:
+          type: string
+          minLength: 1
+        blender:
+          type: string
+          minLength: 1
+        ffmpeg:
+          type: string
+          minLength: 1
+        codex_cli:
+          type: string
+          minLength: 1
+        workflow_sha256:
+          $ref: '#/components/schemas/Sha256'
+        rules_sha256:
+          $ref: '#/components/schemas/Sha256'
+      description: 版本值为完整构建标识；decoder_id 固定解码器、版本、转换实现以及颜色/旋转策略。
+    NodeEnvironment:
+      type: object
+      additionalProperties: false
+      required:
+      - os
+      - arch
+      - gpu
+      - render_backend
+      - compatibility
+      - codex_provider
+      - codex_model
+      - reasoning_effort
+      - model_evidence
+      properties:
+        os:
+          type: string
+          pattern: '^(macOS|Windows) [0-9]+([.][0-9]+){0,3}$'
+          description: 执行节点操作系统和实际版本，例如 macOS 15.7 或 Windows 10.0.26100。
+        arch:
+          type: string
+          minLength: 1
+        gpu:
+          type: string
+          minLength: 1
+        render_backend:
+          type: string
+          minLength: 1
+        compatibility:
+          $ref: '#/components/schemas/Compatibility'
+        codex_provider:
+          anyOf:
+          - type: string
+            minLength: 1
+          - type: 'null'
+        codex_model:
+          anyOf:
+          - type: string
+            minLength: 1
+          - type: 'null'
+        reasoning_effort:
+          anyOf:
+          - type: string
+            minLength: 1
+          - type: 'null'
+        model_evidence:
+          type: string
+          enum:
+          - configured
+          - observed
+          - inherited
+          - unknown
+          description: 注册时可用 configured；本次真实 Codex 执行从日志确认时用 observed；仅出片时用 inherited 追溯审批版；缺失时 unknown，并令缺失的模型字段为
+            null。
+      description: 只传实际工具、驱动、后端和模型标识。注册可报配置值；完成时填本次运行/继承工程核验得到的实际值。供应商 API Key、登录 Cookie 及 Codex 凭据只保存在节点端，不进入本协议。
+    Capabilities:
+      type: object
+      additionalProperties: false
+      required:
+      - work_kinds
+      - profile_hashes
+      - slots
+      - max_frame_width
+      - render_backends
+      - environment
+      properties:
+        work_kinds:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkKind'
+          minItems: 1
+          uniqueItems: true
+        profile_hashes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Sha256'
+          minItems: 1
+          uniqueItems: true
+        slots:
+          type: integer
+          minimum: 1
+        max_frame_width:
+          type: integer
+          minimum: 1
+        render_backends:
+          type: array
+          items:
+            type: string
+            minLength: 1
+          minItems: 1
+          uniqueItems: true
+        environment:
+          $ref: '#/components/schemas/NodeEnvironment'
+    Register:
+      type: object
+      additionalProperties: false
+      required:
+      - node_key
+      - instance_id
+      - capabilities
+      properties:
+        node_key:
+          $ref: '#/components/schemas/ID'
+        instance_id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+          minLength: 1
+        capabilities:
+          $ref: '#/components/schemas/Capabilities'
+      description: node_key 为管理端发放的稳定节点标识，须匹配 Bearer 的主体；instance_id 为执行进程本次启动 UUID。相同主体和 node_key 保持稳定 worker_id，服务端拒绝凭据冒认其他节点。
+    WorkerSession:
+      type: object
+      additionalProperties: false
+      required:
+      - worker_id
+      - server_time
+      - heartbeat_seconds
+      - claim_wait_max_seconds
+      - lease_seconds
+      - lease_heartbeat_seconds
+      - part_size_bytes
+      properties:
+        worker_id:
+          $ref: '#/components/schemas/ID'
+        server_time:
+          type: string
+          format: date-time
+        heartbeat_seconds:
+          const: 30
+        claim_wait_max_seconds:
+          const: 25
+        lease_seconds:
+          const: 90
+        lease_heartbeat_seconds:
+          const: 20
+        part_size_bytes:
+          const: 8388608
+    WorkerHeartbeat:
+      type: object
+      additionalProperties: false
+      required:
+      - instance_id
+      - available_slots
+      - active_work_ids
+      properties:
+        instance_id:
+          type: string
+          format: uuid
+        available_slots:
+          type: integer
+          minimum: 0
+        active_work_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/ID'
+          minItems: 0
+          uniqueItems: true
+      description: 节点心跳只报告可用性。独立的工作心跳负责续租每一项任务。
+    WorkerHeartbeatAck:
+      type: object
+      additionalProperties: false
+      required:
+      - server_time
+      - accept_claims
+      properties:
+        server_time:
+          type: string
+          format: date-time
+        accept_claims:
+          type: boolean
+      description: accept_claims=false 时保留工作心跳，停止领取新任务。
+    Claim:
+      type: object
+      additionalProperties: false
+      required:
+      - worker_id
+      - instance_id
+      - wait_seconds
+      properties:
+        worker_id:
+          $ref: '#/components/schemas/ID'
+        instance_id:
+          type: string
+          format: uuid
+        wait_seconds:
+          type: integer
+          minimum: 0
+          maximum: 25
+          default: 25
+        work_kinds:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkKind'
+          minItems: 1
+          uniqueItems: true
+      description: 根据可用插槽与已注册能力领取一项任务；服务端同时检查 profile_hash、工具版本及输出能力。每次逻辑领取生成新幂等键；相同键重试不得产生第二笔租约。
+    Profile:
+      type: object
+      additionalProperties: false
+      required:
+      - profile_hash
+      - compatibility
+      - final_width
+      - color_policy
+      - signature_scheme
+      - codex_provider
+      - codex_model
+      - reasoning_effort
+      - review_landscape_limit
+      - review_portrait_limit
+      properties:
+        profile_hash:
+          $ref: '#/components/schemas/Sha256'
+        compatibility:
+          $ref: '#/components/schemas/Compatibility'
+        final_width:
+          type: integer
+          minimum: 1
+        production_policy:
+          type: string
+          enum: [codex_trial, human_required]
+          description: 缺省兼容内部试制；正式批次应显式使用 human_required。该批次须由人制作，执行节点拒绝 Codex 首制与返修工单。
+        color_policy:
+          type: string
+          minLength: 1
+        signature_scheme:
+          const: pair-rgb8-timing-v1
+        codex_provider:
+          type: string
+          minLength: 1
+        codex_model:
+          type: string
+          minLength: 1
+        reasoning_effort:
+          type: string
+          minLength: 1
+        review_landscape_limit:
+          $ref: '#/components/schemas/Size'
+        review_portrait_limit:
+          $ref: '#/components/schemas/Size'
+      description: |-
+        profile_hash = SHA-256(JCS(去掉 profile_hash 的本对象))。JCS 为 RFC 8785 的 UTF-8 规范 JSON。signature_scheme 标识锁定的逐帧像素和时间签名算法。
+        dw、dh 为应用旋转与像素宽高比后的有效显示宽高，必须均为正数。零、负值或无有效面积的画幅拒绝送审。最终 W 默认 3840，H = max(2, 2*round((W*dh/dw)/2))；历史版使用冻结的交付尺寸。
+        以最终 W、H 为基准，W≥H 取横屏上限 (1920,1080)，否则取竖屏上限 (1080,1920)。scale = min(1,max_width/W,max_height/H)。审核尺寸分别为 max(1,round(W*scale))、max(1,round(H*scale))。
+        比值均按精确有理数运算，round 取最近整数，恰为一半时取偶数；审核宽和高允许奇数。例如 3840×2154 送审为 1920×1077。
+    InputManifest:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - job_id
+      - work_id
+      - kind
+      - base_version
+      - target_version
+      - profile
+      - artifacts
+      properties:
+        schema_version:
+          const: 1
+        job_id:
+          $ref: '#/components/schemas/ID'
+        work_id:
+          $ref: '#/components/schemas/ID'
+        kind:
+          $ref: '#/components/schemas/WorkKind'
+        base_version:
+          anyOf:
+          - type: integer
+            minimum: 1
+          - type: 'null'
+        sample_id:
+          $ref: '#/components/schemas/ID'
+        target_version:
+          type: integer
+          minimum: 1
+        profile:
+          $ref: '#/components/schemas/Profile'
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+          minItems: 1
+      description: 每个角色仅一份。prepare 基版为 null，目标为 1；revise 目标=基版+1；finalize 目标=基版。均含 source_video、rules_bundle、workflow_bundle。revise
+        另含 source_timeline、scene_bundle、shot_metadata、review_bundle、version_manifest、feedback_manifest 和 approval_manifest（已批子集）。finalize
+        另含上述既有版本输入及全部帧的 approval_manifest，feedback_manifest 可省。服务端保证关联同一作业和基版；节点校验哈希、版本和可复现环境。
+      allOf:
+      - if:
+          properties:
+            kind:
+              const: prepare
+        then:
+          properties:
+            artifacts:
+              allOf:
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: source_video
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: workflow_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: rules_bundle
+                minContains: 1
+                maxContains: 1
+            base_version:
+              type: 'null'
+            target_version:
+              const: 1
+      - if:
+          properties:
+            kind:
+              const: revise
+        then:
+          properties:
+            artifacts:
+              allOf:
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: source_video
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: workflow_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: rules_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: source_timeline
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: scene_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: shot_metadata
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: review_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: version_manifest
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: approval_manifest
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: feedback_manifest
+                minContains: 1
+                maxContains: 1
+            base_version:
+              type: integer
+              minimum: 1
+      - if:
+          properties:
+            kind:
+              const: finalize
+        then:
+          properties:
+            artifacts:
+              allOf:
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: source_video
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: workflow_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: rules_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: source_timeline
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: scene_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: shot_metadata
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: review_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: version_manifest
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  type: object
+                  required:
+                  - role
+                  properties:
+                    role:
+                      const: approval_manifest
+                minContains: 1
+                maxContains: 1
+            base_version:
+              type: integer
+              minimum: 1
+    Lease:
+      type: object
+      additionalProperties: false
+      required:
+      - lease_id
+      - fence
+      - attempt
+      - worker_id
+      - expires_at
+      properties:
+        lease_id:
+          $ref: '#/components/schemas/ID'
+        fence:
+          type: integer
+          minimum: 1
+        attempt:
+          type: integer
+          minimum: 1
+        worker_id:
+          $ref: '#/components/schemas/ID'
+        expires_at:
+          type: string
+          format: date-time
+      description: 每次分派创建新 lease_id 且 work_id 的 fence 单调递增，attempt 从 1 起；只有当前未过期租约能延长或修改工作。
+    Assignment:
+      type: object
+      additionalProperties: false
+      required:
+      - work_id
+      - job_id
+      - kind
+      - lease
+      - input_manifest
+      - input_manifest_sha256
+      properties:
+        work_id:
+          $ref: '#/components/schemas/ID'
+        job_id:
+          $ref: '#/components/schemas/ID'
+        kind:
+          $ref: '#/components/schemas/WorkKind'
+        lease:
+          $ref: '#/components/schemas/Lease'
+        input_manifest:
+          $ref: '#/components/schemas/InputManifest'
+        input_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+      description: input_manifest_sha256 为 input_manifest 完整 JCS 的 SHA-256；所有作业输入均可由新节点从管理端下载。
+    WorkHeartbeat:
+      type: object
+      additionalProperties: false
+      required:
+      - stage
+      - completed
+      - total
+      properties:
+        stage:
+          type: string
+          minLength: 1
+        completed:
+          type: integer
+          minimum: 0
+        total:
+          anyOf:
+          - type: integer
+            minimum: 0
+          - type: 'null'
+      description: completed 与 total 单位相同，未知总量用 null。已知时 completed ≤ total。
+    Control:
+      type: object
+      additionalProperties: false
+      required:
+      - directive
+      - server_time
+      - expires_at
+      properties:
+        directive:
+          $ref: '#/components/schemas/Directive'
+        server_time:
+          type: string
+          format: date-time
+        expires_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+        reason:
+          type: string
+          minLength: 1
+      description: continue 才续租。pause 暂停计算并保留本地校验缓存，恢复由新 claim 完成；stop 终止运行；delete 终止并清理此作业缓存。控制直接使写租约失效，迟到节点从终态查询取得指令。
+      allOf:
+      - if:
+          properties:
+            directive:
+              const: continue
+        then:
+          properties:
+            expires_at:
+              type: string
+              format: date-time
+    Event:
+      type: object
+      additionalProperties: false
+      required:
+      - event_id
+      - sequence
+      - occurred_at
+      - stage
+      - level
+      - message
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        sequence:
+          type: integer
+          minimum: 1
+        occurred_at:
+          type: string
+          format: date-time
+        stage:
+          type: string
+          minLength: 1
+        level:
+          type: string
+          enum:
+          - info
+          - warning
+          - error
+        message:
+          type: string
+          description: 纯文本，须脱敏。
+          minLength: 1
+          maxLength: 4096
+        completed:
+          type: integer
+          minimum: 0
+        total:
+          anyOf:
+          - type: integer
+            minimum: 0
+          - type: 'null'
+      description: sequence 在本次 attempt 内从 1 单调递增；服务端按 work_id、attempt、event_id 去重。同序列异内容报冲突。
+    EventBatch:
+      type: object
+      additionalProperties: false
+      required:
+      - events
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+          minItems: 1
+          maxItems: 100
+    EventAck:
+      type: object
+      additionalProperties: false
+      required:
+      - accepted_through
+      properties:
+        accepted_through:
+          type: integer
+          minimum: 0
+      description: 返回本次 attempt 已连续接收的最大 sequence；客户端从下一序号续报。
+    BeginUpload:
+      type: object
+      additionalProperties: false
+      required:
+      - role
+      - sha256
+      - size_bytes
+      - media_type
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+        size_bytes:
+          type: integer
+          minimum: 1
+        media_type:
+          type: string
+          minLength: 1
+      description: 仅能创建当前 kind 允许的输出角色。size_bytes 是传输对象的总字节数。文件夹使用协议规定的 ZIP。
+    Part:
+      type: object
+      additionalProperties: false
+      required:
+      - part_no
+      - start
+      - end
+      - sha256
+      properties:
+        part_no:
+          type: integer
+          minimum: 1
+        start:
+          type: integer
+          minimum: 0
+        end:
+          type: integer
+          minimum: 0
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+      description: 闭区间；start=(part_no−1)×part_size_bytes，end=min(start+part_size_bytes,size_bytes)−1。
+    Upload:
+      type: object
+      additionalProperties: false
+      required:
+      - upload_id
+      - work_id
+      - role
+      - sha256
+      - size_bytes
+      - part_size_bytes
+      - part_count
+      - state
+      - received_parts
+      properties:
+        upload_id:
+          $ref: '#/components/schemas/ID'
+        work_id:
+          $ref: '#/components/schemas/ID'
+        role:
+          $ref: '#/components/schemas/Role'
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+        size_bytes:
+          type: integer
+          minimum: 1
+        part_size_bytes:
+          const: 8388608
+        part_count:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+          enum:
+          - open
+          - complete
+        received_parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Part'
+          minItems: 0
+        artifact:
+          $ref: '#/components/schemas/Artifact'
+      description: part_count=ceil(size_bytes/part_size_bytes)。received_parts 按 part_no 排序，含断点续传所需的每段摘要；complete
+        时返回 artifact。跨 attempt 不持有前次写授权。
+      allOf:
+      - if:
+          properties:
+            state:
+              const: complete
+        then:
+          required:
+          - artifact
+    SealUpload:
+      type: object
+      additionalProperties: false
+      required:
+      - sha256
+      - part_count
+      properties:
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+        part_count:
+          type: integer
+          minimum: 1
+      description: 校验从 1 连续覆盖总大小、每段及整件字节哈希；sealed artifact 仍是 staging 状态，直到 work complete 原子发布。
+    FrameTime:
+      type: object
+      additionalProperties: false
+      required:
+      - number
+      - pts
+      - duration_pts
+      properties:
+        number:
+          type: integer
+          minimum: 1
+        pts:
+          type: integer
+          minimum: 0
+        duration_pts:
+          type: integer
+          minimum: 1
+      description: number 从 1 开始并且逐一连续；pts 是原显示时间线相对首帧的时间戳，首帧为 0。duration_pts 是下一帧 pts 减本帧 pts，最后一帧用 end_pts。
+    Timeline:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - source_sha256
+      - decoder_id
+      - source_size
+      - display_size
+      - time_base
+      - end_pts
+      - frame_count
+      - frames
+      - average_fps
+      - variable_rate
+      - audio_stream_index
+      - audio_offset
+      properties:
+        schema_version:
+          const: 1
+        source_sha256:
+          $ref: '#/components/schemas/Sha256'
+        decoder_id:
+          type: string
+          minLength: 1
+        source_size:
+          $ref: '#/components/schemas/Size'
+        display_size:
+          $ref: '#/components/schemas/Size'
+        time_base:
+          type: string
+          pattern: ^[1-9][0-9]*/[1-9][0-9]*$
+          description: 已约分的正分数，例如 1/24；签名前逐字使用。
+        end_pts:
+          type: integer
+          minimum: 1
+        frame_count:
+          type: integer
+          minimum: 1
+        frames:
+          type: array
+          items:
+            $ref: '#/components/schemas/FrameTime'
+          minItems: 1
+        average_fps:
+          $ref: '#/components/schemas/Rational'
+        variable_rate:
+          type: boolean
+        audio_stream_index:
+          anyOf:
+          - type: integer
+            minimum: 0
+          - type: 'null'
+        audio_offset:
+          $ref: '#/components/schemas/Rational'
+      description: source_timeline 工件 UTF-8 JSON。time_base 为正有理数；pts 严格递增；保留原片每个呈现帧与时长，VFR 不补帧。frame_count
+        等于 frames 数量；end_pts 是排他的结束时间。display_size 已应用旋转和像素宽高比。audio_offset 单位为秒。
+    Region:
+      type: object
+      additionalProperties: false
+      required:
+      - x
+      - y
+      - w
+      - h
+      - note
+      properties:
+        x:
+          type: number
+          minimum: 0
+          exclusiveMaximum: 1
+        y:
+          type: number
+          minimum: 0
+          exclusiveMaximum: 1
+        w:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1
+        h:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1
+        note:
+          type: string
+          minLength: 1
+      description: 整张上下对比图归一化椭圆外接框，左上角为原点，x+w、y+h ≤1。上半原片，下半白模，缩放不改变位置。
+    FeedbackFrame:
+      type: object
+      additionalProperties: false
+      required:
+      - number
+      - review_signature
+      - note
+      - regions
+      properties:
+        number:
+          type: integer
+          minimum: 1
+        review_signature:
+          $ref: '#/components/schemas/Sha256'
+        note:
+          type: string
+        regions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Region'
+          minItems: 0
+      description: 一行表示一帧汇总后的完整意见。整帧文字或至少一条带文字的圈选必须存在；同上张图、覆盖区间和重复编辑均在冻结前展开并合并，保留每个独立意见。
+      anyOf:
+      - properties:
+          note:
+            minLength: 1
+      - properties:
+          regions:
+            minItems: 1
+    FeedbackManifest:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - job_id
+      - original_annotator_id
+      - base_version
+      - base_manifest_sha256
+      - timeline_sha256
+      - review_size
+      - origin
+      - frames
+      properties:
+        schema_version:
+          const: 1
+        job_id:
+          $ref: '#/components/schemas/ID'
+        original_annotator_id:
+          $ref: '#/components/schemas/ID'
+          description: 首次领取该视频的标注员账号 ID，由管理端从已认证的审核轮冻结，必须与作业永久绑定的原账号一致。
+        base_version:
+          type: integer
+          minimum: 1
+        base_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        timeline_sha256:
+          $ref: '#/components/schemas/Sha256'
+        review_size:
+          $ref: '#/components/schemas/Size'
+        origin:
+          type: string
+          enum:
+          - review
+          - supplement
+        frames:
+          type: array
+          items:
+            $ref: '#/components/schemas/FeedbackFrame'
+          minItems: 1
+      description: feedback_manifest 工件 UTF-8 JSON。按 number 升序、每帧唯一，需要与此前送审版本的签名逐项匹配。原交付后补充意见附着于该基版，保留原审批记录。
+    ApprovalFrame:
+      type: object
+      additionalProperties: false
+      required:
+      - number
+      - review_signature
+      - approved_version
+      properties:
+        number:
+          type: integer
+          minimum: 1
+        review_signature:
+          $ref: '#/components/schemas/Sha256'
+        approved_version:
+          type: integer
+          minimum: 1
+      description: 记录最后一次明确通过且仍适用的原审批版本；继承只允许同源同时间线同审片像素。
+    ApprovalManifest:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - job_id
+      - original_annotator_id
+      - base_version
+      - base_manifest_sha256
+      - source_sha256
+      - timeline_sha256
+      - profile_hash
+      - scene_sha256
+      - scope
+      - frame_count
+      - frames
+      properties:
+        schema_version:
+          const: 1
+        job_id:
+          $ref: '#/components/schemas/ID'
+        original_annotator_id:
+          $ref: '#/components/schemas/ID'
+          description: 本作业所有人工通过的责任账号，必须匹配初次领取视频的原标注员及同一工作项的反馈清单。
+        base_version:
+          type: integer
+          minimum: 1
+        base_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        source_sha256:
+          $ref: '#/components/schemas/Sha256'
+        timeline_sha256:
+          $ref: '#/components/schemas/Sha256'
+        profile_hash:
+          $ref: '#/components/schemas/Sha256'
+        scene_sha256:
+          $ref: '#/components/schemas/Sha256'
+        scope:
+          type: string
+          enum:
+          - approved_subset
+          - all_frames
+        frame_count:
+          type: integer
+          minimum: 1
+        frames:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApprovalFrame'
+          minItems: 0
+      description: approval_manifest 是管理端冻结的 UTF-8 JSON，仅管理端可签发。返修时 frames 为通过帧子集，排除待改与待审；出片时必须覆盖 1..frame_count
+        且与当前版本的送审签名逐帧一致。
+    BundleFile:
+      type: object
+      additionalProperties: false
+      required:
+      - path
+      - size_bytes
+      - sha256
+      properties:
+        path:
+          type: string
+          description: ZIP 内采用 / 分隔的相对路径，大小写与索引一致。
+          minLength: 1
+        size_bytes:
+          type: integer
+          minimum: 0
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+    ReviewFrame:
+      type: object
+      additionalProperties: false
+      required:
+      - number
+      - pts
+      - review_signature
+      - pair_jpeg_path
+      - white_png_path
+      properties:
+        number:
+          type: integer
+          minimum: 1
+        pts:
+          type: integer
+          minimum: 0
+        review_signature:
+          $ref: '#/components/schemas/Sha256'
+          description: pair-rgb8-timing-v1 = SHA256(UTF-8 Python json.dumps([source_sha256, number, pts, time_base,
+            end_tick, [pair_width,pair_height]]) 默认分隔符，逗号后一个空格，无尾换行，随后直接拼接整个合图从左到右、自上而下的 RGB8 字节)。end_tick
+            是本帧排他终点。上半原片按锁定解码器和 Lanczos 缩放送审白模尺寸，下半为实际送审白模 PNG 解码像素；不哈希 JPEG、图片头或每行 padding。
+        pair_jpeg_path:
+          type: string
+          minLength: 1
+        white_png_path:
+          type: string
+          minLength: 1
+      description: PNG 为实际渲染的无损 RGB 白模，JPEG 为送审用上下合图。签名来自锁定算法对精确无损图像与源片时间身份的计算，不以 JPEG 字节代替。
+      x-signature-test-vector:
+        source_sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+        number: 1
+        pts: 0
+        time_base: 1/24
+        end_tick: 1
+        pair_size:
+        - 1
+        - 2
+        rgb8_hex: 000000ffffff
+        expected_sha256: bd16c1d6572399a3c44d67a1c8445b907f6ff97a4a0d16b65a7ae046be695ca1
+    ReviewBundleIndex:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - job_id
+      - target_version
+      - source_sha256
+      - timeline_sha256
+      - profile_hash
+      - scene_sha256
+      - review_size
+      - final_size
+      - files
+      - frames
+      properties:
+        schema_version:
+          const: 1
+        job_id:
+          $ref: '#/components/schemas/ID'
+        target_version:
+          type: integer
+          minimum: 1
+        source_sha256:
+          $ref: '#/components/schemas/Sha256'
+        timeline_sha256:
+          $ref: '#/components/schemas/Sha256'
+        profile_hash:
+          $ref: '#/components/schemas/Sha256'
+        scene_sha256:
+          $ref: '#/components/schemas/Sha256'
+        review_size:
+          $ref: '#/components/schemas/Size'
+        final_size:
+          $ref: '#/components/schemas/Size'
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/BundleFile'
+          minItems: 1
+        frames:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewFrame'
+          minItems: 1
+      description: review_bundle 为 ZIP，根目录 index.json 符合本结构；files 索引除自身外的每个文件，涵盖所有白模 PNG、上下对比 JPEG，可含锁定的无损源帧。逐帧编号与清单一致；每个路径均须能在
+        files 中唯一定位。管理端验证大小、哈希、图形格式、单幅/双幅尺寸和帧覆盖后才入库。
+    VersionManifest:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - job_id
+      - version
+      - source_sha256
+      - timeline_sha256
+      - input_manifest_sha256
+      - profile_hash
+      - scene_sha256
+      - scene_bundle_sha256
+      - review_bundle_sha256
+      - shot_metadata_sha256
+      - production_report_sha256
+      - review_size
+      - final_size
+      - frame_count
+      - frames
+      - environment
+      properties:
+        schema_version:
+          const: 1
+        job_id:
+          $ref: '#/components/schemas/ID'
+        version:
+          type: integer
+          minimum: 1
+        source_sha256:
+          $ref: '#/components/schemas/Sha256'
+        timeline_sha256:
+          $ref: '#/components/schemas/Sha256'
+        input_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        profile_hash:
+          $ref: '#/components/schemas/Sha256'
+        scene_sha256:
+          $ref: '#/components/schemas/Sha256'
+        scene_bundle_sha256:
+          $ref: '#/components/schemas/Sha256'
+        review_bundle_sha256:
+          $ref: '#/components/schemas/Sha256'
+        shot_metadata_sha256:
+          $ref: '#/components/schemas/Sha256'
+        production_report_sha256:
+          $ref: '#/components/schemas/Sha256'
+        review_size:
+          $ref: '#/components/schemas/Size'
+        final_size:
+          $ref: '#/components/schemas/Size'
+        frame_count:
+          type: integer
+          minimum: 1
+        frames:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewFrame'
+          minItems: 1
+        production_method:
+          type: string
+          enum: [codex_trial, human]
+          description: 正式批次出片必须由服务端在已核验的人工作品版本上提供 human；缺省及 Codex 产物都不能作为人工作品。
+        environment:
+          $ref: '#/components/schemas/NodeEnvironment'
+      description: version_manifest 工件 UTF-8 JSON；frames 必须与审片包 index.json 完全一致。scene_sha256 为可编辑 scene.blend
+        文件字节哈希，scene_bundle_sha256 为包含该工程、依赖和文件索引的 ZIP 哈希。
+    ShotMetadata:
+      type: object
+      additionalProperties: false
+      required:
+      - start_frame
+      - end_frame
+      - description
+      properties:
+        start_frame:
+          type: integer
+          minimum: 1
+        end_frame:
+          type: integer
+          minimum: 1
+        description:
+          type: string
+          minLength: 1
+      description: shot_metadata 为 UTF-8 JSONL，每行一段。闭区间依次无缝覆盖 1..frame_count。
+    DeliveryIndex:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - job_id
+      - version
+      - version_manifest_sha256
+      - approval_manifest_sha256
+      - timeline_sha256
+      - final_size
+      - files
+      properties:
+        schema_version:
+          const: 1
+        job_id:
+          $ref: '#/components/schemas/ID'
+        version:
+          type: integer
+          minimum: 1
+        version_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        approval_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        timeline_sha256:
+          $ref: '#/components/schemas/Sha256'
+        final_size:
+          $ref: '#/components/schemas/Size'
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/BundleFile'
+          minItems: 1
+      description: delivery_bundle 中根 index.json 的结构。列出其他所有文件，包括 target/ 原片、white_model/ 白模视频、comparison/ 上下对比视频、model_3d/
+        工程及 meta/ 语义 JSONL。管理端复核文件字节哈希、视频尺寸、PTS 与音轨、工程及审批清单；单独上传的视频和归档内的同一文件须同哈希。
+    Complete:
+      type: object
+      additionalProperties: false
+      required:
+      - input_manifest_sha256
+      - profile_hash
+      - environment
+      - outputs
+      properties:
+        input_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        profile_hash:
+          $ref: '#/components/schemas/Sha256'
+        environment:
+          $ref: '#/components/schemas/NodeEnvironment'
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+          minItems: 1
+        final_verification:
+          $ref: '#/components/schemas/FinalVerification'
+      description: 每个输出角色仅一件，须来自本 work 的已封存 upload。prepare 交 source_timeline、scene_bundle、shot_metadata、review_bundle、version_manifest、production_report；revise
+        交同一组但复用源时间线，无须再上传 source_timeline；finalize 交 white_video、comparison_video、delivery_bundle。管理端核验消重并按
+        kind 原子发布。
+      allOf:
+      - if:
+          properties:
+            outputs:
+              contains:
+                properties:
+                  role:
+                    const: delivery_bundle
+        then:
+          required:
+          - final_verification
+    Receipt:
+      type: object
+      additionalProperties: false
+      required:
+      - receipt_id
+      - job_id
+      - work_id
+      - attempt
+      - kind
+      - state
+      - version
+      - committed_at
+      - artifacts
+      properties:
+        receipt_id:
+          $ref: '#/components/schemas/ID'
+        job_id:
+          $ref: '#/components/schemas/ID'
+        work_id:
+          $ref: '#/components/schemas/ID'
+        attempt:
+          type: integer
+          minimum: 1
+        kind:
+          $ref: '#/components/schemas/WorkKind'
+        state:
+          const: succeeded
+        version:
+          type: integer
+          minimum: 1
+        committed_at:
+          type: string
+          format: date-time
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+          minItems: 1
+      description: 一次提交的永久回执。prepare/revise 的 version 是新送审版本；finalize 的 version 是原审批版本的交付，保留已有交付。
+    Failure:
+      type: object
+      additionalProperties: false
+      required:
+      - code
+      - message
+      - retryable
+      properties:
+        code:
+          type: string
+          enum:
+          - dependency_unavailable
+          - model_unavailable
+          - disk_full
+          - render_failed
+          - input_invalid
+          - profile_mismatch
+          - integrity_failed
+          - other
+        message:
+          type: string
+          description: 已脱敏的诊断。
+          minLength: 1
+          maxLength: 4096
+        retryable:
+          type: boolean
+      description: retryable 是节点建议。服务端按剩余预算、控制状态和错误类型决定重试或终止。
+    FailResult:
+      type: object
+      additionalProperties: false
+      required:
+      - work_state
+      - attempt
+      - retry_after_seconds
+      properties:
+        work_state:
+          type: string
+          enum:
+          - queued
+          - failed
+          - paused
+          - stopped
+          - deleted
+        attempt:
+          type: integer
+          minimum: 1
+        retry_after_seconds:
+          anyOf:
+          - type: integer
+            minimum: 0
+          - type: 'null'
+      description: queued 由服务端重新分派并增加 attempt 和 fence；不得在已失败的租约上继续写入。
+    Status:
+      type: object
+      additionalProperties: false
+      required:
+      - job_id
+      - job_state
+      - work_id
+      - work_state
+      - attempt
+      - directive
+      - current_version
+      - delivery_versions
+      - terminal
+      - server_time
+      properties:
+        job_id:
+          $ref: '#/components/schemas/ID'
+        job_state:
+          $ref: '#/components/schemas/JobState'
+        work_id:
+          $ref: '#/components/schemas/ID'
+        work_state:
+          $ref: '#/components/schemas/WorkState'
+        attempt:
+          type: integer
+          minimum: 0
+        directive:
+          $ref: '#/components/schemas/Directive'
+        current_version:
+          type: integer
+          minimum: 0
+        delivery_versions:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+          minItems: 0
+          uniqueItems: true
+        terminal:
+          type: boolean
+        server_time:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          minLength: 1
+        receipt:
+          $ref: '#/components/schemas/Receipt'
+      description: 节点仅能查询自己领取过的 work_id 所属作业。terminal 指所查 work；succeeded/failed/stopped/deleted 为 true。暂停可恢复，queued/leased
+        仍可能重分配。succeeded 返回 receipt。返回状态可供终端断线恢复或在未知完成回执时查证。 当 job_state=deleted 时仅回终态信息，无 receipt 与交付版本。
+      allOf:
+      - if:
+          properties:
+            work_state:
+              const: succeeded
+            job_state:
+              not:
+                const: deleted
+        then:
+          required:
+          - receipt
+      - if:
+          properties:
+            work_state:
+              enum:
+              - succeeded
+              - failed
+              - stopped
+              - deleted
+        then:
+          properties:
+            terminal:
+              const: true
+        else:
+          properties:
+            terminal:
+              const: false
+      - if:
+          properties:
+            job_state:
+              const: deleted
+        then:
+          not:
+            required:
+            - receipt
+          properties:
+            directive:
+              const: delete
+            delivery_versions:
+              maxItems: 0
+    Error:
+      type: object
+      additionalProperties: false
+      required:
+      - code
+      - message
+      - retryable
+      - request_id
+      properties:
+        code:
+          type: string
+          enum:
+          - invalid_request
+          - unauthenticated
+          - forbidden
+          - not_found
+          - lease_lost
+          - control_changed
+          - idempotency_conflict
+          - part_conflict
+          - range_invalid
+          - hash_mismatch
+          - manifest_invalid
+          - profile_mismatch
+          - not_ready
+          - rate_limited
+          - temporarily_unavailable
+        message:
+          type: string
+          minLength: 1
+        retryable:
+          type: boolean
+        request_id:
+          $ref: '#/components/schemas/ID'
+        directive:
+          $ref: '#/components/schemas/Directive'
+      description: 所有非 2xx 以 JSON 返回。retryable=true 时结合 Retry-After 指示进行退避；未知提交先重发同一幂等键查回执。
+    SceneBundleIndex:
+      type: object
+      additionalProperties: false
+      required:
+      - schema_version
+      - scene_path
+      - scene_sha256
+      - files
+      properties:
+        schema_version:
+          const: 1
+        scene_path:
+          const: scene.blend
+        scene_sha256:
+          $ref: '#/components/schemas/Sha256'
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/BundleFile'
+          minItems: 1
+      description: scene_bundle 为 ZIP，根 index.json 列出自身以外的全部文件；场景依赖使用包内相对地址或已打包到 scene.blend。
+    FinalVerification:
+      type: object
+      additionalProperties: false
+      required:
+      - version_manifest_sha256
+      - approval_manifest_sha256
+      - timeline_sha256
+      - scene_sha256
+      - frame_count
+      - verified_review_frames
+      - white_frame_count
+      - comparison_frame_count
+      - white_size
+      - comparison_size
+      - pts_verified
+      - audio_verified
+      - render_source
+      properties:
+        version_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        approval_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        timeline_sha256:
+          $ref: '#/components/schemas/Sha256'
+        scene_sha256:
+          $ref: '#/components/schemas/Sha256'
+        frame_count:
+          type: integer
+          minimum: 1
+        verified_review_frames:
+          type: integer
+          minimum: 1
+        white_frame_count:
+          type: integer
+          minimum: 1
+        comparison_frame_count:
+          type: integer
+          minimum: 1
+        white_size:
+          $ref: '#/components/schemas/Size'
+        comparison_size:
+          $ref: '#/components/schemas/Size'
+        pts_verified:
+          const: true
+        audio_verified:
+          const: true
+        render_source:
+          enum:
+          - approved_native_white
+          - locked_scene_native_render
+      description: 出片执行结果；三个帧数与 verified_review_frames 都等于冻结时间线 frame_count。white_size 为交付单幅，comparison_size
+        为上下叠图。两路视频实际解码的 PTS、帧长（含片尾）和同期声/无音轨与冻结时间线核对；同时逐帧核验审批签名及 JPEG 摘要，给出所用工程/清单哈希。管理端独立核验上报的材料后提交。
