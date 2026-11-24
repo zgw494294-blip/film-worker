@@ -13,6 +13,8 @@
 
 机器接口见 `contract.openapi.yaml`。Mac 与 Windows 使用同一套锁定源码构建 FFmpeg；领同一制作档案还需使用相符的 Blender、Codex CLI、解码器及执行端版本。不匹配时面板显示要求值和本机值。正式环境使用 HTTPS。与本机模拟服务器联调时，可以在子命令前加 `--test-http`。模型、推理强度、工作流和程序提交由制作档案锁定，节点注册仅公布本机可兑现的档案。
 
+管理端可在出片工单的 `input_manifest.export_quality` 中选 `1080p` 或 `4k`。选项不影响已经通过的审核帧。1080p 在同尺寸时直接编码签名核验通过的白模帧。4K 使用宽 3840 的制作档案。未指定时沿用已通过版本的档案画幅。
+
 标有 PQ 或 HLG 的原片通过随包 FFmpeg 的色调映射生成 BT.709 抽帧和缩略图。归档包中的原始视频保持上传文件的字节和色彩信息。[FFmpeg 色调映射选项](https://ffmpeg.org/ffmpeg-filters.html#scale)
 
 制作、工程检查和渲染使用同一个 Blender 后台启动器。支持控制台崩溃报告的 Blender 会把诊断写入工单日志。执行端在出片环节按原始时码回配和检查同期声。
@@ -22,6 +24,8 @@
 在本机面板点击“启用登录启动”。当前系统账号下次登录后，执行端在后台加载已保存的节点配置，并把启动诊断写入数据目录的 `logs/startup.log`。再次双击原启动文件可打开已有面板，同一数据目录共用一个进程。点击“关闭登录启动”可取消下次登录的自动启动。macOS 使用当前账号的 LaunchAgent，Windows 使用当前账号的计划任务。[macOS LaunchAgent](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html) · [Windows 计划任务](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-create)
 
 ## Git 更新
+
+从 GitHub 发布页安装的新节点默认开启 `stable` 自动检查，安装包内置可信发布公钥。私有仓库的读取权限由节点所在账号的 Git 凭据提供。现有节点可在面板的“Git 更新”开启检查和查看状态。
 
 管理者先执行 `python scripts/release_manifest.py <版本> <递增序号>`，将生成的 `release.json` 随发布代码提交，再用受信任的 SSH 发布私钥签署 annotated tag。升级节点只读取所配置仓库的该标签。签名公钥以 Git `allowed_signers` 格式提供给节点，例如 `publisher ssh-ed25519 AAAA…`。Windows 节点需要 Git 和 OpenSSH 的 `ssh-keygen`。在面板填仓库、标签和公钥文件，开启自动检查，或按“检查并更新”。[Git 签名校验](https://git-scm.com/docs/git-verify-tag) · [可信发布者文件格式](https://git-scm.com/docs/git-config#Documentation/git-config.txt-gpgsshallowedSignersFile)
 

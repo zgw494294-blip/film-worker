@@ -131,6 +131,9 @@ def bundle(args):
         for name in ("README.md", "pyproject.toml", "uv.lock", "install_runtime.py", "contract.openapi.yaml",
                      "启动执行端.cmd", "启动执行端.command"):
             shutil.copy2(ROOT / name, project / name)
+        for name in ("release.json", "release.allowed_signers"):
+            if (ROOT / name).is_file():
+                shutil.copy2(ROOT / name, project / name)
         batch = project / "启动执行端.cmd"
         batch.write_text(batch.read_text(encoding="utf-8"), encoding="utf-8", newline="\r\n")
         shutil.copytree(ROOT / "film_worker", project / "film_worker",

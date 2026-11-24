@@ -81,7 +81,8 @@ class ProductionMock(ThreadingHTTPServer):
             receipt = self.attempts[work]["receipt"]
             return [r for r in receipt["artifacts"] if r["role"] in roles]
 
-    def schedule(self, kind, version, *, slug=None, job="job1", attempt=1, drop_reply=False, artifacts=None):
+    def schedule(self, kind, version, *, slug=None, job="job1", attempt=1, drop_reply=False,
+                 artifacts=None, export_quality=None):
         work = f"work-{slug or kind}"
         artifacts = artifacts or [dict(artifact_id="asset", role=role, sha256=sha(self.input), size_bytes=len(self.input),
                           media_type="application/octet-stream")
@@ -89,6 +90,8 @@ class ProductionMock(ThreadingHTTPServer):
         order = dict(schema_version=1, job_id=job, work_id=work, kind=kind,
                      base_version=None if kind=="prepare" else (version-1 if kind=="revise" else version),
                      target_version=version, profile=self.profile, artifacts=artifacts)
+        if export_quality is not None:
+            order["export_quality"] = export_quality
         assignment = dict(job_id=job, work_id=work, kind=kind, input_manifest=order,
                           input_manifest_sha256=object_hash(order),
                           lease=dict(lease_id=f"lease-{work}-{attempt}", fence=6+attempt,

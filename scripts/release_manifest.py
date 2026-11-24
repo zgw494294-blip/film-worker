@@ -13,11 +13,14 @@ def main():
     parser.add_argument("version")
     parser.add_argument("sequence", type=int)
     parser.add_argument("--target", action="append", choices=TARGETS)
+    parser.add_argument("--update-remote", help="新安装使用的 Git 更新仓库")
     args = parser.parse_args()
     if args.sequence < 1:
         parser.error("发布序号须为正整数")
     data = dict(version=args.version, sequence=args.sequence, platforms=args.target or list(TARGETS),
                 protocol=1, state_format=1, lock_sha256=hashlib.sha256((ROOT/"uv.lock").read_bytes()).hexdigest())
+    if args.update_remote:
+        data["update_remote"] = args.update_remote
     (ROOT/"release.json").write_text(json.dumps(data, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
 
 

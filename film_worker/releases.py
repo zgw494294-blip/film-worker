@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from . import bundles
 from .protocol import digest
-from .settings import ROOT, atomic_json
+from .settings import ROOT, atomic_json, bundled_release
 from .startup import log_directory, running_panel
 from .state import InstanceBusy, instance_lock
 
@@ -62,7 +62,9 @@ class Releases:
     def state(self):
         if self.state_file.exists():
             return json.loads(self.state_file.read_text(encoding="utf-8"))
-        return {"active": BASELINE, "previous": None, "pending": None, "floor": 0, "error": ""}
+        bundled = bundled_release()
+        floor = bundled[1]["sequence"] if bundled else 0
+        return {"active": BASELINE, "previous": None, "pending": None, "floor": floor, "error": ""}
 
     def write(self, data):
         atomic_json(self.state_file, data)

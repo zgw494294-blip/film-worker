@@ -93,6 +93,9 @@ class Production:
     def run(self):
         if not quality.may_author(self.profile, self.kind):
             raise ValueError("正式批次要求人工白模，不领取 Codex 建模或返修")
+        if "export_quality" in self.order and (
+                self.kind != "finalize" or self.order["export_quality"] not in ("1080p", "4k")):
+            raise ValueError("成片质量仅适用于出片工单，可选 1080p 或 4k")
         artifacts = {item["role"]: item for item in self.order["artifacts"]}
         self.progress("prepare_source")
         media_type = artifacts["source_video"]["media_type"]
@@ -360,6 +363,12 @@ class Production:
                     raise
 
     def finalize(self, source):
+        selected = self.order.get("export_quality")
+        if selected == "4k" and self.final_size[0] != 3840:
+            raise ValueError("4K 出片需要宽 3840 的制作档案")
+        output_size = self.final_size
+        if selected == "1080p":
+            output_size = tuple(media.even(axis) for axis in media.review_size(self.timeline))
         _, approved = self.approval()
         self.progress("verify_review", 0, self.count)
         for n, frame in approved.items():
@@ -368,12 +377,12 @@ class Production:
             if white.size != self.review_size or media.signature(pair, self.timeline, n) != frame["review_signature"]:
                 raise ValueError(f"第 {n} 帧审核像素签名核验失败")
             self.progress("verify_review", n, self.count)
-        legacy = self.review_size == self.final_size
-        if legacy:
+        approved_native = self.review_size == output_size
+        if approved_native:
             def render_white(n):
                 return media.rgb(self.prior_review / bundles.safe_path(approved[n]["white_png_path"]))
         else:
-            rendered = self.render(self.scene_file, self.final_size, "final")
+            rendered = self.render(self.scene_file, output_size, "final")
             def render_white(n):
                 return media.rgb(media.frame_path(rendered, n))
         delivery = self.root / "delivery"
@@ -384,9 +393,9 @@ class Production:
         shutil.copyfile(self.scene_file, delivery / "model_3d/scene.blend")
         shutil.copyfile(self.sources["shot_metadata"], delivery / "meta/scene.jsonl")
         white_path, compare_path = delivery / "white_model/white.mp4", delivery / "comparison/comparison.mp4"
-        compare_size = self.final_size[0], self.final_size[1]*2
+        compare_size = output_size[0], output_size[1]*2
         for name, video, extent, read in (
-                ("white", white_path, self.final_size, render_white),
+                ("white", white_path, output_size, render_white),
                 ("comparison", compare_path, compare_size, lambda n: media.comparison(self.frames, render_white(n), n))):
             self.progress("encode_" + name)
             silent = self.root / f"{name}-silent.mp4"
@@ -402,7 +411,7 @@ class Production:
         index = dict(schema_version=1, job_id=self.order["job_id"], version=self.order["target_version"],
                      version_manifest_sha256=digest(self.sources["version_manifest"]),
                      approval_manifest_sha256=digest(self.sources["approval_manifest"]),
-                     timeline_sha256=self.timeline_sha, final_size=dimensions(self.final_size))
+                     timeline_sha256=self.timeline_sha, final_size=dimensions(output_size))
         archive = self.output / "delivery.zip"
         bundles.build(delivery, index, archive)
         self.env.update({k: self.previous["environment"].get(k) for k in ("codex_model","codex_provider","reasoning_effort")},
@@ -410,8 +419,8 @@ class Production:
         verification = {k: index[k] for k in ("version_manifest_sha256", "approval_manifest_sha256", "timeline_sha256")}
         verification.update(scene_sha256=digest(self.scene_file), frame_count=self.count, verified_review_frames=self.count,
                             white_frame_count=self.count, comparison_frame_count=self.count, pts_verified=True,
-                            audio_verified=True, white_size=dimensions(self.final_size), comparison_size=dimensions(compare_size),
-                            render_source="approved_native_white" if legacy else "locked_scene_native_render")
+                            audio_verified=True, white_size=dimensions(output_size), comparison_size=dimensions(compare_size),
+                            render_source="approved_native_white" if approved_native else "locked_scene_native_render")
         return dict(environment=self.env, final_verification=verification,
                     outputs=dict(white_video=str(white_path), comparison_video=str(compare_path), delivery_bundle=str(archive)))
 

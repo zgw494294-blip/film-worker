@@ -85,7 +85,10 @@ class WholeMediaSimulation(unittest.TestCase):
         self.roundtrip(variable=False)
 
     def test_variable_source_timing_survives_revision_by_another_node_and_4k(self):
-        self.roundtrip(variable=True)
+        self.roundtrip(variable=True, export_quality="4k")
+
+    def test_finalize_can_select_1080p_after_approval_under_a_4k_profile(self):
+        self.roundtrip(variable=False, export_quality="1080p")
 
     @unittest.skipUnless(os.getenv("FILM_WORKER_TEST_REAL_CODEX")=="1","requires a locally authenticated Codex profile")
     def test_real_codex_authors_and_revises_work_received_from_the_mock_manager(self):
@@ -122,7 +125,7 @@ class WholeMediaSimulation(unittest.TestCase):
                         preview = review.getpixel((round(sample_x * 320 / 96), review.height//2))
                         self.assertAlmostEqual(preview[0],sdr_value,delta=6)
 
-    def roundtrip(self, *, variable, model=None):
+    def roundtrip(self, *, variable, model=None, export_quality=None):
         with tempfile.TemporaryDirectory(prefix="worker-local-manager-") as directory, mock_service() as service:
             root = Path(directory)
             data = root/"节点 数据"
@@ -221,19 +224,23 @@ class WholeMediaSimulation(unittest.TestCase):
                     status.update(base_version=2,base_manifest_sha256=sha(new["version_manifest"]))
                     approve = self.approval(service,version2,status,all_frames=True,carried=carried)
                     export = service.schedule("finalize",2,artifacts=[*defaults.values(),*timeline,
-                        *service.outputs_from(revised,*REFERENCES),approve],drop_reply=True)
+                        *service.outputs_from(revised,*REFERENCES),approve],drop_reply=True,export_quality=export_quality)
                     self.wait_work(service,node,export,timeout)
                     result = service.blobs_from(export)
                     receipt = service.attempts[export]["body"]["final_verification"]
-                    self.assertEqual(receipt["white_size"],{"width":3840,"height":2160})
-                    self.assertEqual(receipt["comparison_size"],{"width":3840,"height":4320})
+                    hd = export_quality == "1080p"
+                    width, height = (1920,1080) if hd else (3840,2160)
+                    self.assertEqual(receipt["white_size"],{"width":width,"height":height})
+                    self.assertEqual(receipt["comparison_size"],{"width":width,"height":height*2})
+                    self.assertEqual(receipt["render_source"],"approved_native_white" if hd else "locked_scene_native_render")
                     self.assertEqual(receipt["verified_review_frames"],3)
                     self.assertTrue(service.replayed[export])
                     for role in ("white_video","comparison_video"):
                         output = root/(role+".mp4")
                         output.write_bytes(result[role])
                         with patch.dict(os.environ,{"FILM_WORKER_FFPROBE":tools["ffprobe"]}):
-                            _,_,pts,timescale,duration,_ = intake.measure(output)
+                            _,video,pts,timescale,duration,_ = intake.measure(output)
+                        self.assertEqual((video["width"],video["height"]),(width,height if role=="white_video" else height*2))
                         self.assertEqual([n*timescale for n in pts],[f["pts"]*base for f in clock["frames"]])
                         self.assertEqual(duration,sum(durations))
                     with zipfile.ZipFile(io.BytesIO(result["delivery_bundle"])) as deliver:

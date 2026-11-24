@@ -65,8 +65,21 @@ def object_hash(value):
     return hashlib.sha256(rfc8785.dumps(value)).hexdigest()
 
 
+def bundled_release():
+    bootstrap = Path(os.environ.get("FILM_WORKER_BOOTSTRAP", ROOT))
+    release = bootstrap / "release.json"
+    if (bootstrap / "runtime/build.json").is_file() and release.is_file():
+        return bootstrap, json.loads(release.read_text(encoding="utf-8"))
+    return None
+
+
 def load(path):
     settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if bundled := bundled_release():
+        bootstrap, manifest = bundled
+        signers = bootstrap / "release.allowed_signers"
+        if (remote := manifest.get("update_remote")) and signers.is_file():
+            settings = {"update_remote": remote, "update_signers": str(signers), "auto_update": True, **settings}
     return validate_config(settings)
 
 

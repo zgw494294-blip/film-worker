@@ -1370,6 +1370,10 @@ components:
           minimum: 1
         profile:
           $ref: '#/components/schemas/Profile'
+        export_quality:
+          type: string
+          enum: [1080p, 4k]
+          description: 仅 finalize 工单可传。1080p 将制作档案画幅按原比例限制在横屏 1920×1080 或竖屏 1080×1920，输出轴取最接近的偶数。4k 使用宽 3840 的制作档案。省略时按已通过版本的档案画幅出片。
         artifacts:
           type: array
           items:
@@ -1379,6 +1383,12 @@ components:
         另含 source_timeline、scene_bundle、shot_metadata、review_bundle、version_manifest、feedback_manifest 和 approval_manifest（已批子集）。finalize
         另含上述既有版本输入及全部帧的 approval_manifest，feedback_manifest 可省。服务端保证关联同一作业和基版；节点校验哈希、版本和可复现环境。
       allOf:
+      - if:
+          required: [export_quality]
+        then:
+          properties:
+            kind:
+              const: finalize
       - if:
           properties:
             kind:
