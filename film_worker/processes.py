@@ -8,7 +8,8 @@ class ProcessTree:
     def __init__(self, command, *, cwd, env, log):
         self.job = None
         self.child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=log,
-                                      stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
+                                      stderr=subprocess.STDOUT, start_new_session=os.name != "nt",
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         try:
             if os.name == "nt":
                 import win32api

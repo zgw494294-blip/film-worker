@@ -179,4 +179,36 @@ document.querySelector("#test-model").addEventListener("click", async event => {
   }
 });
 
-openPanel();
+const loginStatus = document.querySelector("#login-status");
+const loginToggle = document.querySelector("#login-toggle");
+let loginEnabled = false;
+
+function showLogin(data) {
+  loginEnabled = data.enabled;
+  loginStatus.textContent = loginEnabled ? "已启用 · 下次登录后后台运行" : "未启用";
+  loginToggle.textContent = loginEnabled ? "关闭登录启动" : "启用登录启动";
+}
+
+async function loadLogin() {
+  try {
+    const status = await api("status");
+    const data = await api("login");
+    showLogin(data);
+    loginToggle.disabled = !status.managed || !csrf;
+  } catch (error) {
+    loginStatus.textContent = error.message;
+  }
+}
+
+loginToggle.addEventListener("click", async () => {
+  loginToggle.disabled = true;
+  try {
+    showLogin(await api("login", {enabled: !loginEnabled}));
+  } catch (error) {
+    loginStatus.textContent = error.message;
+  } finally {
+    loginToggle.disabled = false;
+  }
+});
+
+openPanel().then(loadLogin);

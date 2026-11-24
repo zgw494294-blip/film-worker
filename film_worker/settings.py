@@ -38,6 +38,8 @@ DEFAULTS = {
     "update_tag": "stable",
     "update_signers": "",
     "update_interval_minutes": 30,
+    "update_window_start": "",
+    "update_window_end": "",
     "auto_update": False,
 }
 
@@ -77,9 +79,13 @@ def validate_config(settings):
     if type(interval) is not int or not 1 <= interval <= 1440 or type(config["auto_update"]) is not bool:
         raise ValueError("更新周期须为 1–1440 分钟")
     for field in ("server", "node_key", "display_name", "codex", "blender", "ffmpeg", "ffprobe",
-                  "update_remote", "update_tag", "update_signers"):
+                  "update_remote", "update_tag", "update_signers", "update_window_start", "update_window_end"):
         if not isinstance(config[field], str) or "\0" in config[field]:
             raise ValueError(f"{field} 格式错误")
+    start,end = config["update_window_start"],config["update_window_end"]
+    if (start or end) and (start==end or not all(re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", item)
+                                               for item in (start,end))):
+        raise ValueError("自动更新时段需填写不同的开始、结束时间（HH:MM）")
     if not isinstance(config["profiles"], list) or any(not isinstance(p, dict) for p in config["profiles"]):
         raise ValueError("制作档案应为 JSON 数组")
     if config["render_backend"] not in {"auto", "cpu", "metal", "cuda", "optix", "hip", "oneapi"}:
@@ -131,7 +137,8 @@ def resolve_tools(config):
 def version(path, pattern, flag="--version"):
     args = [path, flag]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=20, check=True)
+        result = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=20, check=True,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.SubprocessError as exc:
         raise ValueError(f"{Path(path).name} 版本检测失败") from exc
     match = re.search(pattern, result.stdout)

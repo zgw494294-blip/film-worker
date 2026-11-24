@@ -47,11 +47,19 @@ def verify(path):
                              capture_output=True,encoding="utf-8",check=True,timeout=15)
         if marker.stat().st_mtime_ns != since or Path(out.stdout.strip()) != python:
             raise ValueError("第二次安装未复用第一次下载结果")
+        launcher = [str(python), "-X", "utf8", "-m", "film_worker", "--data", str(data), "launch", "--background"]
+        env.pop("FILM_WORKER_BUNDLED_TOOLS", None)
+        env.pop("FILM_WORKER_UV", None)
+        startup_log = data/"logs/startup.log"
         with (root/"launch.log").open("w+", encoding="utf-8") as log:
-            child = subprocess.Popen([*setup,"--no-browser"],cwd=project,env=env,stdout=log,
+            child = subprocess.Popen(launcher,cwd=project,env=env,stdout=log,
                                      stderr=subprocess.STDOUT,start_new_session=os.name!="nt")
             try:
-                wait_for_panel(child, log)
+                address = wait_for_panel(child, startup_log, log)
+                subprocess.run([*setup,"--no-browser"],cwd=project,env=env,capture_output=True,check=True,timeout=15)
+                with urlopen(address+"/api/status",timeout=2) as response:
+                    if not json.load(response)["managed"]:
+                        raise ValueError("重复打开时后台面板失效")
             finally:
                 if child.poll() is None:
                     if os.name=="nt":
@@ -80,25 +88,26 @@ def verify_media_tools(tools, temp, env):
         raise ValueError("随包媒体工具未按原画幅逐帧解码")
 
 
-def wait_for_panel(child, log):
+def wait_for_panel(child, startup_log, log):
     limit = time.monotonic()+35
     while child.poll() is None and time.monotonic()<limit:
-        log.seek(0)
-        url = next((line.strip() for line in log if line.startswith("http://127.0.0.1:")),None)
+        lines = startup_log.read_text(encoding="utf-8",errors="replace").splitlines() if startup_log.is_file() else []
+        url = next((line.strip() for line in lines if line.startswith("http://127.0.0.1:")),None)
         if url:
             try:
                 with urlopen(url+"/api/status",timeout=2) as response:
                     if json.load(response)["managed"] is True:
-                        return
+                        return url
             except URLError:
                 pass
         time.sleep(0.25)
     log.seek(0)
-    raise RuntimeError("安装包面板启动失败\n"+log.read()[-2000:])
+    startup_output = startup_log.read_text(encoding="utf-8",errors="replace") if startup_log.is_file() else ""
+    raise RuntimeError("安装包面板启动失败\n"+(log.read()+startup_output)[-2000:])
 
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("zip",type=Path)
     verify(parser.parse_args().zip)
-    print("verified offline install, cache reuse and control panel")
+    print("verified offline install, cache reuse and background control panel")

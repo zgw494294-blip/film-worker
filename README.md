@@ -13,11 +13,17 @@
 
 机器接口见 `contract.openapi.yaml`。Mac 与 Windows 使用同一套锁定源码构建 FFmpeg；领同一制作档案还需使用相符的 Blender、Codex CLI、解码器及执行端版本。不匹配时面板显示要求值和本机值。正式环境使用 HTTPS。与本机模拟服务器联调时，可以在子命令前加 `--test-http`。模型、推理强度、工作流和程序提交由制作档案锁定，节点注册仅公布本机可兑现的档案。
 
+## 登录启动
+
+在本机面板点击“启用登录启动”。当前系统账号下次登录后，执行端在后台加载已保存的节点配置，并把启动诊断写入数据目录的 `logs/startup.log`。再次双击原启动文件可打开已有面板，同一数据目录共用一个进程。点击“关闭登录启动”可取消下次登录的自动启动。macOS 使用当前账号的 LaunchAgent，Windows 使用当前账号的计划任务。[macOS LaunchAgent](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html) · [Windows 计划任务](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-create)
+
 ## Git 更新
 
 管理者先执行 `python scripts/release_manifest.py <版本> <递增序号>`，将生成的 `release.json` 随发布代码提交，再用受信任的 SSH 发布私钥签署 annotated tag。升级节点只读取所配置仓库的该标签。签名公钥以 Git `allowed_signers` 格式提供给节点，例如 `publisher ssh-ed25519 AAAA…`。Windows 节点需要 Git 和 OpenSSH 的 `ssh-keygen`。在面板填仓库、标签和公钥文件，开启自动检查，或按“检查并更新”。[Git 签名校验](https://git-scm.com/docs/git-verify-tag) · [可信发布者文件格式](https://git-scm.com/docs/git-config#Documentation/git-config.txt-gpgsshallowedSignersFile)
 
 新版以锁文件准备独立环境，并完成 SQLite、编解码和像素签名自检。切换前暂停领单并等待在途工单收束。新版启动验证失败时自动用上一个版本恢复，也可从面板手动回退。之前已消化的发布序号保持记录，旧签名包不会触发自动降级。管理员须同步准备含新版提交号的制作档案，才能为新版派发相应作业。
+
+自动检查可指定本机时区内的起止时间。例如 23:00 至次日 05:00，检查及准备更新从这一时间段内开始，安装在当前工单提交后进行。开始和结束时间均留空时，按设置的频率全天检查。
 
 用本地 Git 仓库模拟发布与网络 Git 使用相同的签名和版本规则。开发启动目录应保留，因为它是首次安装的启动器和首次回退目标。更新所需的依赖从锁文件安装，优先复用本机 uv 缓存。
 
@@ -30,6 +36,8 @@
 运行 `uv run --locked python -m unittest discover -s tests -v` 可验证分块回传、断点续传、归档路径、复审尺寸和本地状态。媒体验收需将环境变量 `FILM_WORKER_TEST_MEDIA` 设为 `1`，它用测试脚本生成 Blender 场景，并通过真实 Blender、FFmpeg 和 FFprobe 跑首制、返修、出片三步。该用例不会调用在线模型。
 
 模拟服务测试包括双槽位隔离、单单停止、续租重启和同版本重领。重领时核对冻结输入、运行版本和每个输出文件的 SHA-256，再通过新租约上传。文件损坏会重新生成。资格确认和分块回传都使用当前租约。
+
+要验证完整的本机 HTTP 联调，将 `FILM_WORKER_TEST_SIMULATION` 设为 `1`，并准备四个制作工具。执行 `uv run --locked python -m unittest discover -s tests -p test_media_simulation.py -v`。测试用固定的 Blender 场景脚本代替在线模型，跑真实的领单、下载、1080p 首制、原标注员返修、冻结复审批次、4K 编码和交付包回传，验证同一完成回执的重试只归档一次。
 
 在目标系统运行 `uv run --locked python scripts/verify_portable.py <安装包路径>` 可检查安装包摘要、离线安装、重复启动复用、随包媒体工具和本机面板。GitHub Actions 配置包含原生 Apple Silicon Mac 和 Windows x64 两套运行环境，由 Mac 构建同一源码提交的两套安装包，再分别下载到原生系统运行验收。[运行器架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 

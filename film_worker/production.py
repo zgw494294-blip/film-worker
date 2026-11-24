@@ -18,6 +18,8 @@ from .settings import atomic_json
 from .state import slot
 
 HERE = Path(__file__).resolve().parent
+VIDEO_SUFFIXES = {"video/mp4": ".mp4", "video/quicktime": ".mov", "video/x-matroska": ".mkv",
+                  "video/webm": ".webm", "video/x-msvideo": ".avi"}
 
 
 def size(value):
@@ -73,7 +75,8 @@ class Production:
             log = stack.enter_context(logpath.open("ab"))
             prompt = stack.enter_context(stdin.open("rb")) if stdin else subprocess.DEVNULL
             child = subprocess.Popen(command, cwd=self.stage, env=env, stdin=prompt, stdout=log,
-                                     stderr=subprocess.STDOUT)
+                                     stderr=subprocess.STDOUT,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             while child.poll() is None:
                 if frames is not None:
                     self.progress(stage, sum(1 for p in frames.glob("*.png") if p.stem.isdigit()), self.count)
@@ -89,7 +92,8 @@ class Production:
             raise ValueError("正式批次要求人工白模，不领取 Codex 建模或返修")
         artifacts = {item["role"]: item for item in self.order["artifacts"]}
         self.progress("prepare_source")
-        original_suffix = mimetypes.guess_extension(artifacts["source_video"]["media_type"]) or ".video"
+        media_type = artifacts["source_video"]["media_type"]
+        original_suffix = VIDEO_SUFFIXES.get(media_type) or mimetypes.guess_extension(media_type) or ".video"
         source = self.root / ("source" + original_suffix)
         source_sha = artifacts["source_video"].get("sha256") or digest(self.sources["source_video"])
         if not source.exists() or digest(source) != source_sha:

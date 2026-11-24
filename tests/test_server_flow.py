@@ -52,6 +52,8 @@ class ProductionMock(ThreadingHTTPServer):
         self.attempts = {}
         self.claims = {}
         self.uploads = {}
+        self.parts = {}
+        self.objects = {"asset":self.input}
         self.replayed = {}
         self.events = {}
         self.completed = []
@@ -62,9 +64,25 @@ class ProductionMock(ThreadingHTTPServer):
         self.stop_work = {}
         self.heartbeat_interval = 20
 
-    def schedule(self, kind, version, *, slug=None, job="job1", attempt=1, drop_reply=False):
+    def store(self, role, content, mime):
+        identity = f"input-{role}-{sha(content)[:12]}"
+        with self.mutex:
+            self.objects[identity] = content
+        return dict(role=role,artifact_id=identity,sha256=sha(content),size_bytes=len(content),media_type=mime)
+
+    def blobs_from(self, work):
+        with self.mutex:
+            receipt = self.attempts[work]["receipt"]
+            return {r["role"]:self.objects[r["artifact_id"]] for r in receipt["artifacts"]}
+
+    def outputs_from(self, work, *roles):
+        with self.mutex:
+            receipt = self.attempts[work]["receipt"]
+            return [r for r in receipt["artifacts"] if r["role"] in roles]
+
+    def schedule(self, kind, version, *, slug=None, job="job1", attempt=1, drop_reply=False, artifacts=None):
         work = f"work-{slug or kind}"
-        artifacts = [dict(artifact_id="asset", role=role, sha256=sha(self.input), size_bytes=len(self.input),
+        artifacts = artifacts or [dict(artifact_id="asset", role=role, sha256=sha(self.input), size_bytes=len(self.input),
                           media_type="application/octet-stream")
                      for role in ("source_video", "rules_bundle", "workflow_bundle")]
         order = dict(schema_version=1, job_id=job, work_id=work, kind=kind,
@@ -145,19 +163,39 @@ class Fixture(BaseHTTPRequestHandler):
                     result["receipt"] = attempt["receipt"]
                 return self.answer(200, result)
             if path.startswith("artifacts/"):
-                return self.answer(200, server.input, ETag=f'"{sha(server.input)}"')
+                ident = path.split("/")[1]
+                data = server.objects.get(ident)
+                if data is None:
+                    return self.answer(404,{"code":"missing"})
+                return self.answer(200, data, ETag=f'"{sha(data)}"')
             if path.startswith("uploads/"):
-                upload_id = path.split("/")[1]
-                upload = server.uploads[upload_id]
-                if path.endswith("/parts/1"):
-                    if self.headers.get("X-Part-SHA256") != sha(raw):
-                        return self.answer(422, {"code":"hash_mismatch"})
-                    upload["received_parts"] = [dict(part_no=1,start=0,end=len(raw)-1,sha256=sha(raw))]
+                ident = path.split("/")[1]
+                upload = server.uploads[ident]
+                chunks = server.parts[ident]
+                if "/parts/" in path:
+                    part = int(path.rsplit("/",1)[1])
+                    start = (part-1)*upload["part_size_bytes"]
+                    end = start+len(raw)-1
+                    checksum = sha(raw)
+                    boundary = f"bytes {start}-{end}/{upload['size_bytes']}"
+                    if not (1<=part<=upload["part_count"] and end<upload["size_bytes"] and
+                            self.headers.get("X-Part-SHA256")==checksum and
+                            self.headers.get("Content-Range")==boundary):
+                        return self.answer(422,{"code":"hash_mismatch"})
+                    chunks[part] = raw
+                    rows = [row for row in upload["received_parts"] if row["part_no"] != part]
+                    upload["received_parts"] = rows+[dict(part_no=part,start=start,end=end,sha256=checksum)]
                     return self.answer(204)
                 if path.endswith("/complete"):
+                    if len(chunks)!=upload["part_count"]:
+                        return self.answer(409,{"code":"not_ready"})
+                    data = b"".join(chunks[i] for i in range(1,upload["part_count"]+1))
+                    if len(data)!=upload["size_bytes"] or sha(data)!=upload["sha256"]:
+                        return self.answer(422,{"code":"hash_mismatch"})
                     artifact = {k:upload[k] for k in ("role","sha256","size_bytes","media_type")}
                     upload["state"] = "complete"
-                    upload["artifact"] = dict(artifact,artifact_id=upload_id)
+                    upload["artifact"] = dict(artifact,artifact_id=ident)
+                    server.objects[ident] = data
                     return self.answer(200,upload["artifact"])
                 return self.answer(200,upload)
             if path.startswith("work/"):
@@ -194,14 +232,21 @@ class Fixture(BaseHTTPRequestHandler):
                 return self.answer(503, {"code":"unavailable", "retryable":True})
             upload_id = f"up-{work}-{lease['attempt']}-{payload['role']}"
             if upload_id not in server.uploads:
+                parts = (payload["size_bytes"]+8388607)//8388608
                 server.uploads[upload_id] = dict(payload,upload_id=upload_id,work_id=work,state="open",
-                                                  part_count=1,part_size_bytes=8388608,received_parts=[])
+                                                  part_count=parts,part_size_bytes=8388608,received_parts=[])
+                server.parts[upload_id] = {}
             return self.answer(201,server.uploads[upload_id])
+        if command=="fail":
+            attempt["state"] = "failed"
+            attempt["error"] = payload
+            return self.answer(200,dict(work_state="failed",attempt=lease["attempt"],retry_after_seconds=None))
         if command=="complete":
             server.commit_calls.setdefault(work, []).append((lease["attempt"], token, payload))
             if work in server.hold_commits:
                 return self.answer(503, {"code":"unavailable", "retryable":True})
-            if {r["role"] for r in payload["outputs"]} != set(ROLES[kind]):
+            if ({r["role"] for r in payload["outputs"]} != set(ROLES[kind]) or
+                    any(server.uploads.get(o["artifact_id"],{}).get("artifact")!=o for o in payload["outputs"])):
                 return self.answer(422,{"code":"invalid_manifest"})
             if "receipt" in attempt:
                 if attempt["token"] != token or attempt["body"] != payload:

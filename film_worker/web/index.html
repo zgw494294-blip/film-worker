@@ -45,14 +45,21 @@
 <label>Codex CLI<input name="codex"></label><label>Blender<input name="blender"></label>
 <label>FFmpeg<input name="ffmpeg"></label><label>FFprobe<input name="ffprobe"></label>
 </div></details>
+<details id="login"><summary>登录启动</summary>
+<p id="login-status">正在检查登录启动</p>
+<div class="actions"><button type="button" id="login-toggle" disabled>启用登录启动</button></div>
+</details>
 <details><summary>Git 更新</summary>
 <div class="grid">
 <label>Git 仓库<input name="update_remote" placeholder="https://…"></label>
 <label>发布标签<input name="update_tag"></label>
 <label>可信公钥文件<input name="update_signers" placeholder="allowed_signers 的本机绝对路径"></label>
 <label>检查间隔（分钟）<input name="update_interval_minutes" type="number" min="1" max="1440" required></label>
+<label>自动检查开始时间<input name="update_window_start" type="time"></label>
+<label>自动检查结束时间<input name="update_window_end" type="time"></label>
 </div>
 <label class="toggle"><input name="auto_update" type="checkbox">启用自动更新</label>
+<p>时段按本机时间，留空可全天检查。安装时先等本机在途工单提交。</p>
 <div class="actions"><button type="button" data-control="update">检查并更新</button>
 <button type="button" data-control="rollback">回退上个版本</button></div>
 <p id="update-status"></p></details>

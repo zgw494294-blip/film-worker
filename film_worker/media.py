@@ -26,7 +26,7 @@ def write_json(path, value):
 
 def ffmpeg(*args):
     subprocess.run([os.environ.get("FILM_WORKER_FFMPEG", "ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-n", *map(str, args)],
-                   check=True)
+                   check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def even(value):

@@ -22,6 +22,9 @@ def main():
     launch = sub.add_parser("launch", help="运行可自动更新的本机面板")
     launch.add_argument("--port", type=int, default=0)
     launch.add_argument("--no-browser", action="store_true")
+    launch.add_argument("--background", action="store_true", help="由登录任务运行，将诊断写入数据目录")
+    login = sub.add_parser("login",help="管理当前帐号的登录启动")
+    login.add_argument("setting",choices=("status","enable","disable"))
     sub.add_parser("self-test", help="校验本次安装的运行库和程序格式")
     child = sub.add_parser("child", help=argparse.SUPPRESS)
     child.add_argument("directory", type=Path)
@@ -41,7 +44,12 @@ def main():
                 return serve(root, args.port, not args.no_browser, test_http=args.test_http)
         elif args.action == "launch":
             from .releases import launcher
-            return launcher(root, args.port, not args.no_browser, args.test_http)
+            return launcher(root,args.port,not args.no_browser,args.test_http,background=args.background)
+        elif args.action == "login":
+            from .startup import configure_login, login_enabled
+            if args.setting != "status":
+                configure_login(root,args.setting=="enable")
+            print(json.dumps({"login_enabled":login_enabled(root)}))
         elif args.action == "self-test":
             from .selftest import check
             check(root)
@@ -58,7 +66,8 @@ def main():
                 except KeyboardInterrupt:
                     return 0
     except (ValueError, OSError) as exc:
-        print(str(exc), file=sys.stderr)
+        if sys.stderr is not None:
+            print(str(exc), file=sys.stderr)
         return 1
     return 0
 

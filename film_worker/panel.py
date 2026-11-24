@@ -5,11 +5,12 @@ import secrets
 import threading
 import time
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import model
+from . import model, startup
 from .releases import RESTART_FOR_UPDATE, Releases
 from .scheduler import Scheduler
 from .secrets import read_token, store_token
@@ -17,6 +18,16 @@ from .settings import atomic_json, inspect_tools, load, registration, resolve_to
 
 
 WEB = Path(__file__).with_name("web")
+
+
+def update_allowed(config, when):
+    start,end = config["update_window_start"],config["update_window_end"]
+    if not start:
+        return True
+    clock = when.strftime("%H:%M")
+    if start<end:
+        return start<=clock<end
+    return clock>=start or clock<end
 
 
 class Panel(ThreadingHTTPServer):
@@ -30,6 +41,7 @@ class Panel(ThreadingHTTPServer):
         self.runner = None
         self.lock = threading.Lock()
         self.csrf = secrets.token_urlsafe()
+        self.instance = secrets.token_hex(16)
         self.origin = f"http://127.0.0.1:{self.server_port}"
         self.test_http = test_http
         self.start_error = None
@@ -102,7 +114,8 @@ class Panel(ThreadingHTTPServer):
                     next_check = time.monotonic() + interval
                     last_interval = interval
                 if (config["auto_update"] and config["update_remote"] and
-                        time.monotonic() >= next_check and not self.update_lock.locked()):
+                        time.monotonic() >= next_check and not self.update_lock.locked() and
+                        update_allowed(config,datetime.now())):
                     self.update()
                     next_check = time.monotonic() + interval
             except (ValueError, OSError):
@@ -132,6 +145,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self.permitted():
             return self.reply(403, {"error": "请求来源无效"})
         path = urlsplit(self.path).path
+        if path == "/api/instance":
+            return self.reply(200, {"instance":self.server.instance})
+        if path == "/api/login":
+            try:
+                return self.reply(200, {"enabled":startup.login_enabled(self.server.root)})
+            except (ValueError,OSError) as exc:
+                return self.reply(400, {"error":str(exc)})
         if path == "/api/status":
             return self.reply(200, self.server.summary())
         if path == "/api/config":
@@ -153,6 +173,12 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < count <= 1024 * 1024:
                 raise ValueError("配置数据过大")
             payload = json.loads(self.rfile.read(count))
+            if self.path == "/api/login":
+                if not node.managed:
+                    raise ValueError("请通过启动器运行后设置登录启动")
+                with node.lock:
+                    startup.configure_login(node.root,payload.get("enabled"))
+                    return self.reply(200, {"enabled":startup.login_enabled(node.root)})
             if self.path == "/api/model-draft":
                 return self.reply(200, {"profile":model.draft(payload["base"],payload["model"])})
             if self.path == "/api/model-test":
@@ -224,6 +250,8 @@ def serve(root, port, browser, *, test_http=False):
             except (ValueError, OSError) as exc:
                 server.start_error = str(exc)
         threading.Thread(target=server.poll_updates, daemon=True).start()
+        marker = startup.endpoint_file(root)
+        atomic_json(marker,{"port":server.server_port,"instance":server.instance})
         print(server.origin, flush=True)
         if browser:
             webbrowser.open(server.origin)
@@ -233,6 +261,7 @@ def serve(root, port, browser, *, test_http=False):
             pass
         finally:
             server.update_halt.set()
+            marker.unlink(missing_ok=True)
             if server.runner:
                 server.scheduler.stop.set()
                 server.runner.join()

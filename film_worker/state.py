@@ -8,6 +8,10 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 
+class InstanceBusy(BlockingIOError):
+    """Another process is already holding this lock."""
+
+
 @contextmanager
 def instance_lock(root: Path):
     root.mkdir(parents=True, exist_ok=True)
@@ -18,12 +22,17 @@ def instance_lock(root: Path):
             lock.write(b"0")
             lock.flush()
         lock.seek(0)
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if isinstance(exc,BlockingIOError) or (os.name=="nt" and exc.errno in {13,36}):
+                raise InstanceBusy("该数据目录已经有执行端在运行") from exc
+            raise
         yield
 
 

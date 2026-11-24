@@ -17,7 +17,7 @@ from pathlib import Path
 
 def probe(source, *options):
     command = [os.environ.get("FILM_WORKER_FFPROBE", "ffprobe"), "-v", "error", *options, "-of", "json", str(source)]
-    return json.loads(subprocess.check_output(command))
+    return json.loads(subprocess.check_output(command, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
 
 
 def measure(source):

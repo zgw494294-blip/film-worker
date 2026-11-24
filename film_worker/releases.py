@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 import os
 import platform
 import re
@@ -17,7 +18,8 @@ from urllib.parse import urlsplit
 from . import bundles
 from .protocol import digest
 from .settings import ROOT, atomic_json
-from .state import instance_lock
+from .startup import log_directory, running_panel
+from .state import InstanceBusy, instance_lock
 
 BASELINE = {"commit": "", "version": "local", "sequence": 0}
 RESTART_FOR_UPDATE = 75
@@ -40,7 +42,8 @@ def executable(project):
 def run(args, *, cwd=None, env=None, timeout=120):
     try:
         return subprocess.run(args, cwd=cwd, env=env, check=True, capture_output=True, encoding="utf-8",
-                              errors="replace", timeout=timeout).stdout.strip()
+                              errors="replace", timeout=timeout,
+                              creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0)).stdout.strip()
     except subprocess.CalledProcessError as exc:
         # Git output can contain remote credentials; expose only the command category.
         raise ValueError(f"{Path(args[0]).name} 执行失败（退出码 {exc.returncode}）") from exc
@@ -162,10 +165,43 @@ def bundled_uv(project):
     return None
 
 
-def launcher(root, port, browser, test_http):
+def reopen(root, browser):
+    url = running_panel(root)
+    if url and browser:
+        import webbrowser
+        webbrowser.open(url)
+        print(url, flush=True)
+    return bool(url)
+
+
+def launcher(root, port, browser, test_http, *, background=False):
     releases = Releases(root)
-    # A single launcher owns the active pointer, but the child owns the separate worker lock.
-    with instance_lock(releases.data / "launcher-lock"):
+    if background:
+        browser = False
+    if reopen(root,browser):
+        return 0
+    with ExitStack() as context:
+        # The release launcher and the inner panel each own their own lock.
+        try:
+            context.enter_context(instance_lock(releases.data/"launcher-lock"))
+        except InstanceBusy:
+            if not browser:
+                return 0
+            wait_until = time.monotonic()+12
+            while time.monotonic()<wait_until:
+                if reopen(root,True):
+                    return 0
+                time.sleep(0.25)
+            raise ValueError("执行端正在启动或切换版本，请稍后再次打开")
+        bundled_paths()
+        log = None
+        if background:
+            log_path = log_directory(root)/"startup.log"
+            if log_path.is_file() and log_path.stat().st_size >= 1024*1024:
+                log_path.replace(log_path.with_suffix(".log.1"))
+            log = context.enter_context(log_path.open("a",encoding="utf-8",buffering=1))
+            if sys.platform=="darwin":
+                os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:"+os.environ.get("PATH","")
         while True:
             state = releases.state()
             selected = state["pending"] or state["active"]
@@ -173,8 +209,10 @@ def launcher(root, port, browser, test_http):
             try:
                 project = releases.directory(selected)
                 python = executable(project) if selected["commit"] else Path(sys.executable)
-                port, code = launch_panel(project, python, root, port, browser, test_http, releases, selected, state)
-            except (ValueError, OSError) as exc:
+                port, code = launch_panel(project,python,root,port,browser,test_http,releases,selected,state,log)
+            except (ValueError,OSError) as exc:
+                if log:
+                    print(str(exc),file=log,flush=True)
                 if not pending:
                     raise
                 state.update(pending=None, error=f"新版启动失败，已恢复原版 · {exc}")
@@ -185,19 +223,33 @@ def launcher(root, port, browser, test_http):
             browser = False
 
 
-def launch_panel(project, python, root, port, browser, test_http, releases, selected, state):
+def bundled_paths():
+    runtime = Path(sys.executable).parent.parent.parent
+    if not (runtime/"installed.txt").is_file():
+        return
+    uv = runtime/("uv.exe" if os.name=="nt" else "uv")
+    if uv.is_file():
+        os.environ.setdefault("FILM_WORKER_UV",str(uv))
+    if (runtime/"tools").is_dir():
+        os.environ.setdefault("FILM_WORKER_BUNDLED_TOOLS",str(runtime/"tools"))
+
+
+def launch_panel(project, python, root, port, browser, test_http, releases, selected, state, log=None):
     run_id = uuid.uuid4().hex
     handshake = releases.data / "launch" / run_id
     handshake.mkdir(parents=True)
     env = dict(os.environ, FILM_WORKER_LAUNCH=str(handshake), FILM_WORKER_RELEASE=selected["commit"],
-               FILM_WORKER_BOOTSTRAP=str(ROOT))
+               FILM_WORKER_BOOTSTRAP=str(ROOT), FILM_WORKER_BOOTSTRAP_PYTHON=sys.executable)
     startup = [str(python), "-m", "film_worker", "--data", str(root)]
     if test_http:
         startup.append("--test-http")
     command = [*startup, "panel", "--port", str(port), "--no-browser"]
     child = None
     try:
-        child = subprocess.Popen(command, cwd=project, env=env)
+        output = {"stdout":log,"stderr":subprocess.STDOUT} if log else {}
+        if log and os.name=="nt":
+            output["creationflags"] = subprocess.CREATE_NO_WINDOW
+        child = subprocess.Popen(command,cwd=project,env=env,**output)
         ready = handshake / "ready.json"
         limit = time.monotonic() + 45
         while not ready.is_file():

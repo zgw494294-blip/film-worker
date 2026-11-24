@@ -36,8 +36,8 @@ class ProductionTests(unittest.TestCase):
                            review_portrait_limit=dict(width=rh,height=rw), profile_hash="f"*64,
                            compatibility=dict(decoder_id="fixture"))
 
-            def run(kind, previous, version, inputs):
-                directory = base / ("attempt-" + kind)
+            def run(kind, previous, version, inputs, attempt=""):
+                directory = base / ("attempt-" + kind + attempt)
                 directory.mkdir()
                 fixtures = {role: Path(path) for role, path in inputs.items()}
                 artifacts = [dict(role=k, media_type="video/mp4" if k=="source_video" else "application/octet-stream")
@@ -73,12 +73,17 @@ class ProductionTests(unittest.TestCase):
             revised = media.read_json(Path(second["version_manifest"]))
             self.assertNotEqual(orig["frames"][1]["review_signature"], revised["frames"][1]["review_signature"])
             second_sha = hashlib.sha256(Path(second["version_manifest"]).read_bytes()).hexdigest()
-            media.write_json(approval, dict(origin, base_version=2, base_manifest_sha256=second_sha,
+            approved = dict(origin, base_version=2, base_manifest_sha256=second_sha,
                     scope="all_frames", source_sha256=revised["source_sha256"], profile_hash=revised["profile_hash"],
                     scene_sha256=revised["scene_sha256"], frame_count=3,
                     frames=[dict(number=f["number"], review_signature=f["review_signature"], approved_version=2)
-                            for f in revised["frames"]]))
-            result = run("finalize", 2, 2, {**edit_inputs, **second})
+                            for f in revised["frames"]])
+            final_inputs = {**edit_inputs, **second}
+            media.write_json(approval, {**approved, "frames": approved["frames"][:2]})
+            with self.assertRaisesRegex(ValueError, "审批清单未覆盖全片"):
+                run("finalize", 2, 2, final_inputs, "-incomplete")
+            media.write_json(approval, approved)
+            result = run("finalize", 2, 2, final_inputs)
             check = result["final_verification"]
             self.assertEqual(check["render_source"], "locked_scene_native_render")
             self.assertEqual(check["white_size"], dict(width=fw,height=fh))
@@ -104,7 +109,11 @@ s.cycles.samples = 1
 s.cycles.use_denoising = False
 s.frame_start = 1
 s.frame_end = {worker.count}
-bpy.data.objects["Cube"].location.x = {0 if preparing else 1}
+if not {preparing!r}:
+    subject = bpy.data.objects["Cube"]
+    for frame, x in ((1, 0), (2, 1), (3, 0)):
+        subject.location.x = x
+        subject.keyframe_insert(data_path="location", frame=frame)
 bpy.context.preferences.filepaths.save_version = 0
 bpy.ops.wm.save_as_mainfile(filepath={str(worker.stage / 'scene.blend')!r})
 """,encoding="utf-8")
