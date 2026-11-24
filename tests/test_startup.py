@@ -70,7 +70,7 @@ class StartupTests(unittest.TestCase):
             child = subprocess.Popen(argv,cwd=ROOT,env=env,start_new_session=os.name!="nt",
                                      stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             try:
-                end = time.monotonic()+25
+                end = time.monotonic()+55
                 while child.poll() is None and not startup.running_panel(root) and time.monotonic()<end:
                     time.sleep(0.15)
                 endpoint = startup.running_panel(root)

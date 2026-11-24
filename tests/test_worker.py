@@ -135,20 +135,25 @@ class ProcessTests(unittest.TestCase):
     def test_closing_tree_kills_grandchild_after_leader_exit(self):
         with tempfile.TemporaryDirectory(prefix="worker-process-") as tmp:
             root = Path(tmp)
-            ready, survived = root/"ready", root/"survived"
+            ready, check_survival, survived = root/"ready", root/"check-survival", root/"survived"
             subprocess_code = """import os, signal, sys, time
 from pathlib import Path
 if os.name != "nt":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 Path(sys.argv[1]).touch()
-time.sleep(2)
-Path(sys.argv[2]).touch()
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    if Path(sys.argv[2]).exists():
+        Path(sys.argv[3]).touch()
+        break
+    time.sleep(0.025)
 """
             leader_code = """import os, subprocess, sys
 if os.read(sys.stdin.fileno(),1)==b"1":
     subprocess.Popen(sys.argv[1:])
 """
-            args = [sys.executable,"-c",leader_code,sys.executable,"-c",subprocess_code,str(ready),str(survived)]
+            args = [sys.executable,"-c",leader_code,sys.executable,"-c",subprocess_code,
+                    str(ready),str(check_survival),str(survived)]
             with (root/"worker.log").open("wb") as log:
                 tree = ProcessTree(args,cwd=root,env=os.environ,log=log)
                 try:
@@ -159,6 +164,7 @@ if os.read(sys.stdin.fileno(),1)==b"1":
                     self.assertTrue(ready.exists())
                 finally:
                     tree.close()
+                check_survival.touch()
                 time.sleep(2.1)
                 self.assertFalse(survived.exists())
 

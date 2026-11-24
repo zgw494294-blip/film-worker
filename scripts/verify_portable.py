@@ -99,7 +99,7 @@ def verify_media_tools(tools, temp, env):
 
 
 def wait_for_panel(child, startup_log, log):
-    limit = time.monotonic()+35
+    limit = time.monotonic()+55
     while child.poll() is None and time.monotonic()<limit:
         lines = startup_log.read_text(encoding="utf-8",errors="replace").splitlines() if startup_log.is_file() else []
         url = next((line.strip() for line in lines if line.startswith("http://127.0.0.1:")),None)

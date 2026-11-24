@@ -6,12 +6,16 @@ on:
       bundle_ref:
         description: Git tag or commit to package and verify
         type: string
+      published_release:
+        description: GitHub release tag whose uploaded installation packages should be tested
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build-distribution:
+    if: ${{ !inputs.published_release }}
     timeout-minutes: 25
     runs-on: macos-15
     strategy:
@@ -38,6 +42,7 @@ jobs:
 
   verify:
     needs: build-distribution
+    if: ${{ !cancelled() && (needs.build-distribution.result == 'success' || (needs.build-distribution.result == 'skipped' && inputs.published_release)) }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -48,6 +53,8 @@ jobs:
           - os: windows-2025
             target: windows-x86_64
     runs-on: ${{ matrix.os }}
+    env:
+      BUNDLE_PATH: ${{ inputs.published_release && format('dist/film-worker-{0}-{1}.zip', inputs.published_release, matrix.target) || format('dist/电影复刻执行端-{0}.zip', matrix.target) }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -60,14 +67,25 @@ jobs:
           FILM_WORKER_TEST_LOGIN: "1"
         run: uv run --locked python -m unittest discover -s tests -v
       - uses: actions/download-artifact@v8
+        id: built
+        if: ${{ !cancelled() && !inputs.published_release }}
         with:
           name: worker-${{ matrix.target }}
           path: dist
+      - name: Download the published installation package and its checksum
+        id: published
+        if: ${{ !cancelled() && inputs.published_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.published_release }}
+        shell: bash
+        run: gh release download --repo "$GITHUB_REPOSITORY" --dir dist --pattern "${BUNDLE_PATH##*/}*" -- "$RELEASE_TAG"
       - name: Exercise offline installation and the installed panel on Mac
-        if: runner.os == 'macOS'
-        run: uv run --locked python scripts/verify_portable.py "dist/电影复刻执行端-${{ matrix.target }}.zip"
+        if: ${{ !cancelled() && runner.os == 'macOS' && (steps.built.outcome == 'success' || steps.published.outcome == 'success') }}
+        run: uv run --locked python scripts/verify_portable.py "$BUNDLE_PATH"
       - name: Prepare pinned Blender and Codex for native Windows verification
-        if: runner.os == 'Windows'
+        id: windows_tools
+        if: ${{ !cancelled() && runner.os == 'Windows' && (steps.built.outcome == 'success' || steps.published.outcome == 'success') }}
         shell: pwsh
         run: |
           $toolRoot = Join-Path $env:RUNNER_TEMP film-worker-test-tools
@@ -88,6 +106,6 @@ jobs:
           if (!$blender -or !$codex) { throw 'Could not locate the native Windows tools' }
           "FILM_TEST_BLENDER=$($blender.FullName)" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
           "FILM_TEST_CODEX=$($codex.FullName)" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
-      - name: Verify the installed Windows bundle through 1080p review and 4K export
-        if: runner.os == 'Windows'
-        run: uv run --locked python scripts/verify_portable.py "dist/电影复刻执行端-${{ matrix.target }}.zip" --simulate
+      - name: Verify offline installation, 1080p review, and 1080p and 4K export on Windows
+        if: ${{ !cancelled() && steps.windows_tools.outcome == 'success' }}
+        run: uv run --locked python scripts/verify_portable.py "$env:BUNDLE_PATH" --simulate
