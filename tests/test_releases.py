@@ -27,7 +27,7 @@ class ReleaseTests(unittest.TestCase):
             data = root/"data"
             data.mkdir()
             shutil.copytree(ROOT/"film_worker", remote/"film_worker", ignore=shutil.ignore_patterns("._*", "__pycache__"))
-            for name in ("pyproject.toml", "uv.lock"):
+            for name in (".gitattributes", "pyproject.toml", "uv.lock"):
                 shutil.copyfile(ROOT/name, remote/name)
             release_key = root/"release-key"
             self.run_command(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(release_key)])
@@ -35,6 +35,7 @@ class ReleaseTests(unittest.TestCase):
             signers.write_text("publisher " + release_key.with_suffix(".pub").read_text())
             self.run_command(["git", "init", "-q", str(remote)])
             for field, value in (("user.name", "Publisher"), ("user.email", "publisher@example.test"),
+                                 ("core.autocrlf", "true"),
                                  ("gpg.format", "ssh"), ("user.signingkey", str(release_key))):
                 self.run_command(["git", "-C", str(remote), "config", field, value])
             config = dict(update_remote=str(remote), update_tag="stable", update_signers=str(signers))

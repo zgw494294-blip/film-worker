@@ -2,6 +2,10 @@ name: Worker platform verification
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      bundle_ref:
+        description: Git tag or commit to package and verify
+        type: string
 
 permissions:
   contents: read
@@ -16,6 +20,8 @@ jobs:
         target: [macos-arm64, windows-x86_64]
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.bundle_ref || github.sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
