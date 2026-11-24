@@ -70,12 +70,12 @@ class StartupTests(unittest.TestCase):
             with (Path(directory)/"launcher.log").open("wb") as output:
                 tree = ProcessTree(argv,cwd=ROOT,env=env,log=output)
             child = tree.child
+            log = root/"logs/startup.log"
             try:
                 end = time.monotonic()+55
                 while child.poll() is None and not startup.running_panel(root) and time.monotonic()<end:
                     time.sleep(0.15)
                 endpoint = startup.running_panel(root)
-                log = root/"logs/startup.log"
                 self.assertTrue(endpoint,log.read_text(encoding="utf-8") if log.exists() else "no log")
                 with startup.endpoint_file(root).open(encoding="utf-8") as handle:
                     address = json.load(handle)
@@ -86,6 +86,17 @@ class StartupTests(unittest.TestCase):
                 self.assertIn(endpoint,log.read_text(encoding="utf-8"))
             finally:
                 tree.close()
+                if os.name == "nt":
+                    # Windows may finish closing the terminated panel's log asynchronously.
+                    deadline = time.monotonic()+5
+                    while True:
+                        try:
+                            log.unlink(missing_ok=True)
+                            break
+                        except PermissionError:
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.05)
 
     def test_update_window_supports_midnight_and_legacy_all_day(self):
         def when(hour,minute):
