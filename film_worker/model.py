@@ -1,5 +1,6 @@
 """Build Codex CLI options and read the selected-model evidence."""
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -30,9 +31,10 @@ def evidence(header):
 def test(binary, profile):
     with tempfile.TemporaryDirectory(prefix="film-model-test-") as directory:
         command = [*options(binary, profile, directory, sandbox="read-only"), "只回答 FILM_WORKER_OK"]
+        env = {key: value for key, value in os.environ.items() if key != "FILM_WORKER_TOKEN"}
         try:
             output = subprocess.run(command, cwd=directory, check=True, timeout=100, capture_output=True,
-                                    encoding="utf-8", errors="replace")
+                                    encoding="utf-8", errors="replace", env=env)
         except subprocess.SubprocessError as exc:
             raise ValueError("Codex 模型调用失败，请核对本机登录和模型服务配置") from exc
         observed = evidence(output.stderr[:32768])
