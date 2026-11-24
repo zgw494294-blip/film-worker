@@ -135,6 +135,8 @@ class Transfer:
         return self.retry(lambda: self.api.json(method, path, body=body, headers=headers)[0])
 
     def download(self, artifact, working):
+        from .state import slot
+
         expected = valid_digest(artifact["sha256"])
         size = artifact["size_bytes"]
         target = self.cache / expected
@@ -181,11 +183,16 @@ class Transfer:
             partial.replace(target)
             return target
 
-        return self.retry(transfer)
+        # Two leases may need the same source or rule bundle. Serialize publication of
+        # each digest so Windows never has to replace the object a sibling is reading.
+        with slot(self.cache.parent / "locks", expected[:2], 1, self.stop):
+            return self.retry(transfer)
 
-    def upload(self, role, path: Path, media_type, progress=lambda *_: None):
+    def upload(self, role, path: Path, media_type, progress=lambda *_: None, *, expected_sha=None):
         size = path.stat().st_size
         sha = digest(path)
+        if expected_sha is not None and sha != expected_sha:
+            raise ValueError("产物在上传前发生变化")
         body = dict(role=role, sha256=sha, size_bytes=size, media_type=media_type)
         started = self.json("POST", f"/work/{self.work}/uploads", body, f"begin:{role}:{sha}")
         upload = f"/uploads/{opaque(started['upload_id'])}"

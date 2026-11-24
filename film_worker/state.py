@@ -100,8 +100,10 @@ class State:
 
     def queued_events(self, assignment):
         with self.connection() as db:
+            # Retry the exact event key and body after a response is lost, even if later
+            # events were appended before the acknowledgement arrived.
             return [json.loads(row[0]) for row in db.execute("""SELECT event FROM events WHERE work=? AND number=?
-                AND accepted=0 ORDER BY sequence LIMIT 100""", identity(assignment))]
+                AND accepted=0 ORDER BY sequence LIMIT 1""", identity(assignment))]
 
     def accept_events(self, assignment, sequence):
         with self.connection() as db:

@@ -29,6 +29,10 @@
 
 运行 `uv run --locked python -m unittest discover -s tests -v` 可验证分块回传、断点续传、归档路径、复审尺寸和本地状态。媒体验收需将环境变量 `FILM_WORKER_TEST_MEDIA` 设为 `1`，它用测试脚本生成 Blender 场景，并通过真实 Blender、FFmpeg 和 FFprobe 跑首制、返修、出片三步。该用例不会调用在线模型。
 
+模拟服务测试包括双槽位隔离、单单停止、续租重启和同版本重领。重领时核对冻结输入、运行版本和每个输出文件的 SHA-256，再通过新租约上传。文件损坏会重新生成。资格确认和分块回传都使用当前租约。
+
+在目标系统运行 `uv run --locked python scripts/verify_portable.py <安装包路径>` 可检查安装包摘要、离线安装、重复启动复用和本机面板。GitHub Actions 配置包含原生 Apple Silicon Mac 和 Windows x64 两套运行环境，可在接入 Git 仓库时执行同一验收。[运行器架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+
 
 ## 附件里的验收要求
 

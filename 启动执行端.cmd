@@ -3,12 +3,12 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 if exist "runtime\python\python.exe" (
-    "runtime\python\python.exe" -B install_runtime.py %*
+    "runtime\python\python.exe" -X utf8 -B install_runtime.py %*
     if errorlevel 1 pause
     exit /b
 )
 if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" -m film_worker launch %*
+    ".venv\Scripts\python.exe" -X utf8 -m film_worker launch %*
 ) else (
     where uv.exe >nul 2>&1
     if errorlevel 1 (

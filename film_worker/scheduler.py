@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .processes import ProcessTree
-from .protocol import Client, Interrupted, ProtocolError, Transfer, key, opaque
+from .protocol import Client, Interrupted, ProtocolError, Transfer, digest, key, opaque
 from .settings import KINDS, ROOT, atomic_json, environment, inspect_tools, object_hash, profile_matches, registration, resolve_tools
 from .state import State, identity, slot
 
@@ -22,6 +22,12 @@ ROLE_TYPES = {
     "scene_bundle": "application/zip", "review_bundle": "application/zip", "version_manifest": "application/json",
     "source_timeline": "application/json", "production_report": "application/json", "shot_metadata": "application/x-ndjson",
     "delivery_bundle": "application/zip", "white_video": "video/mp4", "comparison_video": "video/mp4",
+}
+
+OUTPUT_ROLES = {
+    "prepare": {"source_timeline", "scene_bundle", "shot_metadata", "review_bundle", "version_manifest", "production_report"},
+    "revise": {"scene_bundle", "shot_metadata", "review_bundle", "version_manifest", "production_report"},
+    "finalize": {"white_video", "comparison_video", "delivery_bundle"},
 }
 
 
@@ -38,6 +44,7 @@ class LeaseWatch:
         self.events = events
         self.deadline = deadline
         self.closed = threading.Event()
+        self.confirmed = threading.Event()
         self.directive = ""
         self.worker = threading.Thread(target=self.watch, daemon=True)
 
@@ -47,7 +54,13 @@ class LeaseWatch:
 
     def __exit__(self, *exc):
         self.closed.set()
-        self.worker.join(timeout=9)
+        self.worker.join(timeout=12)
+
+    def wait_for_confirmation(self):
+        while not self.stop.is_set():
+            if self.confirmed.wait(0.1) and not self.stop.is_set():
+                return
+        raise Interrupted
 
     def watch(self):
         while not self.closed.is_set() and not self.stop.is_set():
@@ -66,6 +79,10 @@ class LeaseWatch:
                 now = datetime.fromisoformat(response["server_time"])
                 expires = datetime.fromisoformat(response["expires_at"])
                 self.deadline = before + (expires - now).total_seconds() - 2
+                if self.deadline <= time.monotonic():
+                    self.directive = "lease_expired"
+                    break
+                self.confirmed.set()
                 self.events.send(status)
                 self.closed.wait(max(0, min(self.seconds, self.deadline - time.monotonic())))
             except ProtocolError as exc:
@@ -195,8 +212,11 @@ class Scheduler:
                         self.recover()
                         self.reconcile()
                         next_reconcile = time.monotonic() + 60
+                    with self.lock:
+                        free = self.cfg["slots"] - len(self.active)
                     enough = shutil.disk_usage(self.root).free >= self.cfg["disk_reserve_gib"] * 1024**3
-                    if accept and enough and not self.drain.is_set() and not self.stop_after_drain.is_set() and len(ids) < self.cfg["slots"] and now >= next_poll:
+                    if accept and enough and free > 0 and now >= next_poll and not (
+                            self.drain.is_set() or self.stop_after_drain.is_set()):
                         wait = self.claim()
                         next_poll = time.monotonic() + wait
                     retry = 1
@@ -218,7 +238,8 @@ class Scheduler:
 
     def claim(self):
         pending = self.state.setting("claim")
-        if not pending or pending["body"]["instance_id"] != self.instance_id:
+        if not pending or (pending["body"]["instance_id"], pending["body"]["worker_id"]) != (
+                self.instance_id, self.session["worker_id"]):
             # Short polls allow a node heartbeat and drain even behind a slow server.
             pending = {"key": str(uuid.uuid4()), "body": dict(worker_id=self.session["worker_id"],
                        instance_id=self.instance_id, wait_seconds=min(5, self.session["claim_wait_max_seconds"]),
@@ -227,8 +248,16 @@ class Scheduler:
         start = time.monotonic()
         assignment, wait = self.api.json("POST", "/work/claim", body=pending["body"],
                                          headers={"Idempotency-Key": pending["key"]}, timeout=10)
-        if assignment and self.state.start(assignment):
-            self.launch(assignment, start + self.session["lease_seconds"] - 2)
+        if assignment:
+            work, attempt = identity(assignment)
+            lease = assignment["lease"]
+            opaque(work)
+            opaque(lease["lease_id"])
+            if (lease["worker_id"] != self.session["worker_id"] or
+                    type(attempt) is not int or attempt < 1 or type(lease["fence"]) is not int or lease["fence"] < 1):
+                raise ValueError("服务端返回的租约身份无效")
+            if self.state.start(assignment):
+                self.launch(assignment, start + self.session["lease_seconds"] - 2)
         self.state.set("claim", None)
         return wait or 0
 
@@ -256,10 +285,12 @@ class Scheduler:
         current = {"directory": folder, "stop": threading.Event(),
                    "progress": dict(stage="received", completed=0, total=None)}
         with self.lock:
-            if ident in self.active:
-                return
+            if any(work == ident[0] for work, _ in self.active) or len(self.active) >= self.cfg["slots"]:
+                return False
             self.active[ident] = current
-        self.pool.submit(self.execute, assignment, deadline, current, pending)
+        heartbeat_seconds = self.session["lease_heartbeat_seconds"]
+        self.pool.submit(self.execute, assignment, deadline, heartbeat_seconds, current, pending)
+        return True
 
     def work_status(self, assignment):
         return self.api.json("GET", f"/jobs/{opaque(assignment['job_id'])}/status?work_id={opaque(assignment['work_id'])}")[0]
@@ -297,8 +328,8 @@ class Scheduler:
                 if control["directive"] == "continue":
                     seconds = (datetime.fromisoformat(control["expires_at"]) -
                                datetime.fromisoformat(control["server_time"])).total_seconds()
-                    self.launch(assignment, start+seconds-2, json.loads(row["pending"]) if row["pending"] else None)
-                    free -= 1
+                    if self.launch(assignment, start+seconds-2, json.loads(row["pending"]) if row["pending"] else None):
+                        free -= 1
                 else:
                     self.state.mark(assignment, status="interrupted", message=control["directive"])
             else:
@@ -328,25 +359,40 @@ class Scheduler:
             if result["job_state"] == "deleted":
                 shutil.rmtree(self.root / "work" / opaque(assignment["work_id"]), ignore_errors=True)
 
-    def execute(self, assignment, deadline, current, pending):
+    def execute(self, assignment, deadline, heartbeat_seconds, current, pending):
+        try:
+            self.execute_attempt(assignment, deadline, heartbeat_seconds, current, pending)
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            self.state.mark(assignment, message=f"执行工单初始化或收尾失败 · {type(exc).__name__}")
+        finally:
+            with self.lock:
+                del self.active[identity(assignment)]
+
+    def execute_attempt(self, assignment, deadline, heartbeat_seconds, current, pending):
         directory = current["directory"]
         transfer = Transfer(self.api, assignment, current["stop"], self.root / "cache/sha256")
         progress = lambda: self.current(directory, current["progress"])
         events = Events(self.state, assignment, transfer)
-        watch = LeaseWatch(transfer, self.session["lease_heartbeat_seconds"], deadline, progress, events)
+        watch = LeaseWatch(transfer, heartbeat_seconds, deadline, progress, events)
         try:
             with watch:
+                watch.wait_for_confirmation()
                 try:
                     def report(stage):
                         atomic_json(directory / "progress.json", dict(stage=stage, completed=0, total=None))
                     if pending is None:
                         profile, artifacts = self.check_assignment(assignment)
-                        report("download")
-                        with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
-                            paths = {role: str(transfer.download(artifact, directory)) for role, artifact in artifacts.items()}
-                        if transfer.stop.is_set():
-                            raise Interrupted
-                        pending = self.produce(assignment, profile, paths, directory, transfer, progress)
+                        checkpoint = self.load_checkpoint(assignment, directory, transfer.stop)
+                        if checkpoint is None:
+                            report("download")
+                            with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
+                                paths = {role: str(transfer.download(artifact, directory)) for role, artifact in artifacts.items()}
+                            if transfer.stop.is_set():
+                                raise Interrupted
+                            pending = self.produce(assignment, profile, paths, directory, transfer, progress)
+                        else:
+                            report("reuse_outputs")
+                            pending = self.upload_result(assignment, profile, checkpoint, directory, transfer)
                     events.send(dict(stage="commit_result", completed=0, total=None))
                     receipt = transfer.json("POST", f"/work/{transfer.work}/complete", pending, "complete")
                     self.state.mark(assignment, status="succeeded", receipt=receipt)
@@ -372,9 +418,6 @@ class Scheduler:
                     self.state.mark(assignment, message=watch.directive or str(exc))
             except (ProtocolError, KeyError, ValueError):
                 self.state.mark(assignment, message=watch.directive or str(exc))
-        finally:
-            with self.lock:
-                del self.active[identity(assignment)]
 
     def produce(self, assignment, profile, paths, directory, transfer, progress):
         result_file = directory / "result.json"
@@ -400,15 +443,57 @@ class Scheduler:
                 error = read(error_file) if error_file.is_file() else dict(code="render_failed", message="制作进程中止")
                 raise WorkFailure(dict(error, retryable=error["code"] not in {"input_invalid", "profile_mismatch"}))
         result = read(result_file)
+        if set(result["outputs"]) != OUTPUT_ROLES[assignment["kind"]]:
+            raise ValueError("产物角色与工单类型不符")
+        artifacts = {}
+        for role, raw in result["outputs"].items():
+            path = Path(raw).resolve()
+            if not path.is_relative_to(directory.resolve()) or not path.is_file():
+                raise ValueError("产物路径越界或文件不存在")
+            if transfer.stop.is_set():
+                raise Interrupted
+            artifacts[role] = {"name": str(path.relative_to(directory.resolve())), "sha256": digest(path),
+                               "size": path.stat().st_size}
+        checkpoint = dict(result, outputs=artifacts, attempt=assignment["lease"]["attempt"],
+                          input_manifest_sha256=assignment["input_manifest_sha256"], versions=self.versions)
+        atomic_json(directory.parent / "outputs.json", checkpoint)
+        return self.upload_result(assignment, profile, checkpoint, directory, transfer)
+
+    def load_checkpoint(self, assignment, directory, stopped):
+        try:
+            checkpoint = read(directory.parent / "outputs.json")
+            attempt = checkpoint["attempt"]
+            if (type(attempt) is not int or not 1 <= attempt <= assignment["lease"]["attempt"] or
+                    checkpoint["input_manifest_sha256"] != assignment["input_manifest_sha256"] or
+                    checkpoint["versions"] != self.versions or
+                    set(checkpoint["outputs"]) != OUTPUT_ROLES[assignment["kind"]]):
+                return None
+            for artifact in checkpoint["outputs"].values():
+                if stopped.is_set():
+                    raise Interrupted
+                path = self.checkpoint_path(directory, attempt, artifact)
+                if digest(path) != artifact["sha256"]:
+                    return None
+            return checkpoint
+        except (KeyError, OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def checkpoint_path(directory, attempt, artifact):
+        version = (directory.parent / str(attempt)).resolve()
+        path = (version / artifact["name"]).resolve()
+        if not path.is_relative_to(version) or path.stat().st_size != artifact["size"]:
+            raise ValueError("产物路径或长度与检查点不符")
+        return path
+
+    def upload_result(self, assignment, profile, result, directory, transfer):
         outputs = []
         with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
-            for role, raw in result["outputs"].items():
-                path = Path(raw).resolve()
-                if not path.is_relative_to(directory.resolve()):
-                    raise ValueError("产物路径越界")
+            for role, artifact in result["outputs"].items():
+                path = self.checkpoint_path(directory, result["attempt"], artifact)
                 def update(done, total):
                     atomic_json(directory / "progress.json", dict(stage="upload_" + role, completed=done, total=total))
-                outputs.append(transfer.upload(role, path, ROLE_TYPES[role], update))
+                outputs.append(transfer.upload(role, path, ROLE_TYPES[role], update, expected_sha=artifact["sha256"]))
         payload = dict(input_manifest_sha256=assignment["input_manifest_sha256"], profile_hash=profile["profile_hash"],
                        environment=result["environment"], outputs=outputs)
         if "final_verification" in result:

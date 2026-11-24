@@ -36,12 +36,18 @@ class ProcessTree:
         self.child.stdin.close()
         if self.job is not None:
             self.job.Close()
-        elif self.child.poll() is None:
+        else:
+            # The leader may have exited while its tool processes still hold the group.
+            self.signal_group(signal.SIGTERM)
             try:
-                os.killpg(self.child.pid, signal.SIGTERM)
                 self.child.wait(timeout=5)
-            except ProcessLookupError:
-                pass
             except subprocess.TimeoutExpired:
-                os.killpg(self.child.pid, signal.SIGKILL)
+                pass
+            self.signal_group(signal.SIGKILL)
         self.child.wait(timeout=10)
+
+    def signal_group(self, sig):
+        try:
+            os.killpg(self.child.pid, sig)
+        except ProcessLookupError:
+            pass

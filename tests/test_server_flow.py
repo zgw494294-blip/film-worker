@@ -7,11 +7,13 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+from film_worker.protocol import Interrupted
 from film_worker.scheduler import Scheduler
 from film_worker.settings import DEFAULTS, atomic_json, environment, object_hash
 
@@ -53,22 +55,27 @@ class ProductionMock(ThreadingHTTPServer):
         self.replayed = {}
         self.events = {}
         self.completed = []
-        self.release_drop = threading.Event()
+        self.commit_calls = {}
+        self.hold_commits = set()
+        self.stop_work = {}
+        self.heartbeat_interval = 20
 
-    def schedule(self, kind, version):
-        work = f"work-{kind}"
+    def schedule(self, kind, version, *, slug=None, job="job1", attempt=1, drop_reply=False):
+        work = f"work-{slug or kind}"
         artifacts = [dict(artifact_id="asset", role=role, sha256=sha(self.input), size_bytes=len(self.input),
                           media_type="application/octet-stream")
                      for role in ("source_video", "rules_bundle", "workflow_bundle")]
-        order = dict(schema_version=1, job_id="job1", work_id=work, kind=kind,
+        order = dict(schema_version=1, job_id=job, work_id=work, kind=kind,
                      base_version=None if kind=="prepare" else (version-1 if kind=="revise" else version),
                      target_version=version, profile=self.profile, artifacts=artifacts)
-        assignment = dict(job_id="job1", work_id=work, kind=kind, input_manifest=order,
+        assignment = dict(job_id=job, work_id=work, kind=kind, input_manifest=order,
                           input_manifest_sha256=object_hash(order),
-                          lease=dict(lease_id="lease-"+kind, fence=7, attempt=1, worker_id="node", expires_at=now(85)))
+                          lease=dict(lease_id=f"lease-{work}-{attempt}", fence=6+attempt,
+                                     attempt=attempt, worker_id="node", expires_at=now(85)))
         with self.mutex:
             self.queue.append(assignment)
-            self.attempts[work] = {"assignment":assignment, "state":"queued"}
+            self.attempts[work] = {"assignment":assignment, "state":"queued", "drop_reply":drop_reply}
+        return work
 
 
 class Fixture(BaseHTTPRequestHandler):
@@ -108,7 +115,7 @@ class Fixture(BaseHTTPRequestHandler):
             if path=="workers/register":
                 server.registered.append(payload)
                 return self.answer(200, dict(worker_id="node", server_time=now(), heartbeat_seconds=30,
-                                            claim_wait_max_seconds=25, lease_seconds=90, lease_heartbeat_seconds=20,
+                                            claim_wait_max_seconds=25, lease_seconds=90, lease_heartbeat_seconds=server.heartbeat_interval,
                                             part_size_bytes=8388608))
             if path=="workers/node/heartbeat":
                 return self.answer(200, dict(server_time=now(), accept_claims=True))
@@ -120,14 +127,18 @@ class Fixture(BaseHTTPRequestHandler):
                     server.attempts[assignment["work_id"]]["state"] = "leased"
                     return self.answer(200, assignment)
                 return self.answer(204, **{"Retry-After":"1"})
-            if path.startswith("jobs/job1/status?work_id="):
+            if path.startswith("jobs/") and "/status?work_id=" in path:
                 work = path.split("=")[-1]
                 attempt = server.attempts[work]
                 state = attempt["state"]
-                result = dict(job_id="job1",work_id=work,job_state="done" if "work-finalize" in server.completed else "review",
-                              work_state=state,attempt=1,directive="continue",current_version=len(server.completed),
-                              delivery_versions=[2] if "work-finalize" in server.completed else [],
-                              terminal=state=="succeeded",server_time=now())
+                version = attempt["assignment"]["input_manifest"]["target_version"]
+                delivered = "work-finalize" in server.completed
+                result = dict(job_id=attempt["assignment"]["job_id"], work_id=work,
+                              job_state=state if state in {"paused", "stopped", "deleted"} else ("done" if delivered else "review"),
+                              work_state=state, attempt=attempt["assignment"]["lease"]["attempt"],
+                              directive=server.stop_work.get(work, "continue"),current_version=version,
+                              delivery_versions=[2] if delivered else [],terminal=state in {"succeeded","stopped","deleted"},
+                              server_time=now())
                 if "receipt" in attempt:
                     result["receipt"] = attempt["receipt"]
                 return self.answer(200, result)
@@ -155,12 +166,18 @@ class Fixture(BaseHTTPRequestHandler):
         work, command = path.split("/")[1:3]
         attempt = server.attempts[work]
         kind = attempt["assignment"]["kind"]
-        if self.headers.get("X-Lease-Id") != "lease-"+kind or self.headers.get("X-Fence") != "7":
+        lease = attempt["assignment"]["lease"]
+        if self.headers.get("X-Lease-Id") != lease["lease_id"] or self.headers.get("X-Fence") != str(lease["fence"]):
             return self.answer(409,{"code":"lease_lost"})
         if command=="heartbeat":
-            return self.answer(200,dict(directive="continue",server_time=now(),expires_at=now(85)))
+            directive = server.stop_work.get(work, "continue")
+            if directive != "continue":
+                attempt["state"] = {"pause":"paused", "stop":"stopped", "delete":"deleted"}[directive]
+            return self.answer(200, dict(directive=directive, server_time=now(),
+                                         expires_at=now(85) if directive=="continue" else None))
         if command=="events":
-            history = server.events.setdefault(work,{})
+            histories = server.events.setdefault(work,{})
+            history = histories.setdefault(lease["attempt"],{})
             for event in payload["events"]:
                 seq = event["sequence"]
                 if seq in history and history[seq] != event:
@@ -170,12 +187,15 @@ class Fixture(BaseHTTPRequestHandler):
                 history[seq] = event
             return self.answer(200, {"accepted_through":len(history)})
         if command=="uploads":
-            upload_id = f"up-{kind}-{payload['role']}"
+            upload_id = f"up-{work}-{lease['attempt']}-{payload['role']}"
             if upload_id not in server.uploads:
                 server.uploads[upload_id] = dict(payload,upload_id=upload_id,work_id=work,state="open",
                                                   part_count=1,part_size_bytes=8388608,received_parts=[])
             return self.answer(201,server.uploads[upload_id])
         if command=="complete":
+            server.commit_calls.setdefault(work, []).append((lease["attempt"], token, payload))
+            if work in server.hold_commits:
+                return self.answer(503, {"code":"unavailable", "retryable":True})
             if {r["role"] for r in payload["outputs"]} != set(ROLES[kind]):
                 return self.answer(422,{"code":"invalid_manifest"})
             if "receipt" in attempt:
@@ -184,11 +204,12 @@ class Fixture(BaseHTTPRequestHandler):
                 server.replayed[work] = True
                 return self.answer(200,attempt["receipt"])
             version = attempt["assignment"]["input_manifest"]["target_version"]
-            receipt = dict(receipt_id="receipt-"+kind,kind=kind,state="succeeded",version=version,
-                           job_id="job1",work_id=work,attempt=1,committed_at=now(),artifacts=payload["outputs"])
+            receipt = dict(receipt_id="receipt-"+work,kind=kind,state="succeeded",version=version,
+                           job_id=attempt["assignment"]["job_id"],work_id=work,attempt=lease["attempt"],
+                           committed_at=now(),artifacts=payload["outputs"])
             attempt.update(receipt=receipt,body=payload,token=token,state="succeeded")
             server.completed.append(work)
-            if kind=="prepare":
+            if attempt["drop_reply"]:
                 self.connection.shutdown(socket.SHUT_RDWR)
                 self.close_connection = True
                 return
@@ -196,51 +217,141 @@ class Fixture(BaseHTTPRequestHandler):
         return self.answer(404,{"code":"missing"})
 
 
+@contextmanager
+def mock_service():
+    with ProductionMock() as service:
+        serving = threading.Thread(target=service.serve_forever)
+        serving.start()
+        try:
+            yield service
+        finally:
+            service.shutdown()
+            serving.join(timeout=10)
+
+
+@contextmanager
+def node_running(config, root, produce):
+    with patch("film_worker.scheduler.resolve_tools", return_value={}), patch(
+            "film_worker.scheduler.inspect_tools", return_value=VERSIONS), patch.object(Scheduler, "produce", produce):
+        node = Scheduler(config, root, "fixture", test_http=True)
+        worker = threading.Thread(target=node.run)
+        worker.start()
+        try:
+            yield node
+        finally:
+            node.stop.set()
+            worker.join(timeout=20)
+            if worker.is_alive():
+                raise AssertionError("worker failed to stop")
+
+
+def node_config(service, slots=1):
+    return {**DEFAULTS, "node_key":"fixture", "server":f"http://127.0.0.1:{service.server_port}",
+            "profiles":[service.profile], "disk_reserve_gib":1, "slots":slots}
+
+
+production = Scheduler.produce
+
+
+def fixture_outputs(node, assignment, profile, paths, directory, transfer, progress):
+    env = environment(node.cfg, node.versions, profile)
+    outputs = {}
+    for role in ROLES[assignment["kind"]]:
+        path = directory/(role+".bin")
+        path.write_bytes((role+assignment["kind"]).encode())
+        outputs[role] = str(path)
+    atomic_json(directory/"result.json", dict(outputs=outputs, environment=env))
+    return production(node, assignment, profile, paths, directory, transfer, progress)
+
+
 class WorkerFlow(unittest.TestCase):
     def test_registration_to_review_and_final_delivery_with_lost_receipt(self):
-        with tempfile.TemporaryDirectory(prefix="worker-flow-") as folder, ProductionMock() as service:
-            root = Path(folder)
-            service_thread=threading.Thread(target=service.serve_forever)
-            service_thread.start()
-            def fixture_outputs(self, assignment, profile, paths, directory, transfer, progress):
-                env = environment(self.cfg,self.versions,profile)
-                outputs={}
-                for role in ROLES[assignment["kind"]]:
-                    path = directory/(role+".bin")
-                    path.write_bytes((role+assignment["kind"]).encode())
-                    outputs[role]=str(path)
-                atomic_json(directory/"result.json",dict(outputs=outputs,environment=env))
-                return original(self, assignment, profile, paths, directory, transfer, progress)
+        with tempfile.TemporaryDirectory(prefix="worker-flow-") as folder, mock_service() as service:
+            service.schedule("prepare",1,drop_reply=True)
+            with node_running(node_config(service), Path(folder), fixture_outputs) as node:
+                self.wait_for(lambda: service.replayed.get("work-prepare"), node)
+                self.wait_for(lambda: node.state.rows()[0]["status"]=="succeeded", node)
+                self.assertEqual(len(service.registered),1)
+                self.assertEqual(service.completed,["work-prepare"])
+                service.schedule("revise",2)
+                self.wait_for(lambda:"work-revise" in service.completed,node)
+                service.schedule("finalize",2)
+                self.wait_for(lambda:len(node.state.rows())==3 and all(
+                    r["status"]=="succeeded" for r in node.state.rows()),node)
+                node.reconcile()
+                self.assertEqual(node.state.setting("job:job1")["delivery_versions"],[2])
+                self.assertEqual(service.completed,["work-prepare","work-revise","work-finalize"])
+                self.assertIn("commit_result", {e["stage"] for e in service.events["work-prepare"][1].values()})
 
-            config={**DEFAULTS,"node_key":"fixture","server":f"http://127.0.0.1:{service.server_port}",
-                    "profiles":[service.profile],"disk_reserve_gib":1}
-            original = Scheduler.produce
-            service.schedule("prepare",1)
-            with patch("film_worker.scheduler.resolve_tools",return_value={}), patch(
-                    "film_worker.scheduler.inspect_tools",return_value=VERSIONS), patch.object(Scheduler,"produce",fixture_outputs):
-                node=Scheduler(config,root,"fixture",test_http=True)
-                worker=threading.Thread(target=node.run)
-                worker.start()
-                try:
-                    self.wait_for(lambda: service.replayed.get("work-prepare"), node)
-                    self.wait_for(lambda: node.state.rows()[0]["status"]=="succeeded", node)
-                    self.assertEqual(len(service.registered),1)
-                    self.assertEqual(service.completed,["work-prepare"])
-                    # Model the human submit/pass events by making the next server-side work visible.
-                    service.schedule("revise",2)
-                    self.wait_for(lambda:"work-revise" in service.completed,node)
-                    service.schedule("finalize",2)
-                    self.wait_for(lambda:len(node.state.rows())==3 and all(
-                        r["status"]=="succeeded" for r in node.state.rows()),node)
-                    node.reconcile()
-                    self.assertEqual(node.state.setting("job:job1")["delivery_versions"],[2])
-                    self.assertEqual(service.completed,["work-prepare","work-revise","work-finalize"])
-                    self.assertIn("commit_result", {e["stage"] for e in service.events["work-prepare"].values()})
-                finally:
-                    node.stop.set()
-                    worker.join(timeout=20)
-                    service.shutdown()
-                    service_thread.join(timeout=10)
+    def test_stopping_one_work_does_not_stop_a_sibling_slot(self):
+        with tempfile.TemporaryDirectory(prefix="worker-multi-") as folder, mock_service() as service:
+            service.heartbeat_interval = 1
+            first = service.schedule("prepare",1,slug="first",job="job-a")
+            second = service.schedule("prepare",1,slug="second",job="job-b")
+            entered = {first:threading.Event(),second:threading.Event()}
+            continue_second = threading.Event()
+
+            def pause_fixture(node,assignment,profile,paths,directory,transfer,progress):
+                work = assignment["work_id"]
+                entered[work].set()
+                if work==first:
+                    if not transfer.stop.wait(10):
+                        raise AssertionError("server command not honored")
+                    raise Interrupted
+                if not continue_second.wait(10):
+                    raise AssertionError("sibling fixture timeout")
+                return fixture_outputs(node,assignment,profile,paths,directory,transfer,progress)
+
+            with node_running(node_config(service, slots=2), Path(folder), pause_fixture) as node:
+                self.wait_for(lambda: all(event.is_set() for event in entered.values()), node)
+                self.assertEqual({a["work_id"] for a in node.summary()["active"]}, {first,second})
+                with service.mutex:
+                    service.stop_work[first] = "stop"
+                self.wait_for(lambda:any(row["work"]==first and row["status"]=="interrupted"
+                                         for row in node.state.rows()),node)
+                self.assertEqual([a["work_id"] for a in node.summary()["active"]],[second])
+                continue_second.set()
+                self.wait_for(lambda: service.completed == [second],node)
+                self.assertNotIn(first, service.commit_calls)
+
+    def test_restart_resumes_queued_result_and_reuses_same_input_after_reassignment(self):
+        for reassign, tamper in ((False,False), (True,False), (True,True)):
+            with self.subTest(reassign=reassign, tamper=tamper), tempfile.TemporaryDirectory(prefix="worker-resume-") as folder, mock_service() as service:
+                work = service.schedule("prepare",1)
+                service.hold_commits.add(work)
+                config = node_config(service)
+                produced = []
+
+                def track(node,assignment,profile,paths,directory,transfer,progress):
+                    produced.append(assignment["lease"]["attempt"])
+                    return fixture_outputs(node,assignment,profile,paths,directory,transfer,progress)
+
+                with node_running(config, Path(folder), track) as node:
+                    self.wait_for(lambda: bool(service.commit_calls.get(work)),node)
+                    first_row = node.state.rows()[0]
+                    self.assertIsNotNone(first_row["pending"])
+                    self.assertGreater(len(service.uploads),0)
+
+                with service.mutex:
+                    service.hold_commits.remove(work)
+                if reassign:
+                    service.schedule("prepare",1,attempt=2)
+                if tamper:
+                    file = Path(folder)/"work"/work/"1/scene_bundle.bin"
+                    file.write_bytes(b"!"*file.stat().st_size)
+                with node_running(config, Path(folder), track) as node:
+                    attempt = 2 if reassign else 1
+                    self.wait_for(lambda:any(r["number"]==attempt and r["status"]=="succeeded"
+                                             for r in node.state.rows()),node)
+                    self.assertEqual(produced,[1,2] if tamper else [1])
+                    calls = service.commit_calls[work]
+                    self.assertEqual(calls[-1][0],attempt)
+                    if not reassign:
+                        self.assertEqual(calls[0],calls[-1])
+                    else:
+                        self.assertNotEqual(calls[0][1],calls[-1][1])
+                        self.assertEqual([a["sha256"] for a in calls[0][2]["outputs"]],
+                                         [a["sha256"] for a in calls[-1][2]["outputs"]])
 
     def wait_for(self, condition, node):
         limit=time.monotonic()+12

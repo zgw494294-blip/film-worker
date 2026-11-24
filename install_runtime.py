@@ -137,7 +137,8 @@ def main():
     command += ["launch", "--port", str(args.port)]
     if args.no_browser:
         command.append("--no-browser")
-    env = dict(os.environ, FILM_WORKER_UV=str(installed_uv), FILM_WORKER_BUNDLED_TOOLS=str(installed_uv.parent/"tools"))
+    env = dict(os.environ, PYTHONUTF8="1", FILM_WORKER_UV=str(installed_uv),
+               FILM_WORKER_BUNDLED_TOOLS=str(installed_uv.parent/"tools"))
     if os.name != "nt":
         os.execve(str(python), command, env)
     try:
