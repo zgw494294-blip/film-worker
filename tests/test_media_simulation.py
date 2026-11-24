@@ -3,15 +3,16 @@ import io
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 import unittest
 import zipfile
+from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
 
+from film_worker import intake
 from film_worker.processes import ProcessTree
 from film_worker.scheduler import Scheduler
 from film_worker.settings import ROOT, inspect_tools, object_hash, resolve_tools
@@ -37,6 +38,14 @@ def start_fixture(command, *, cwd, env, log):
     return ProcessTree([command[0],str(worker),command[-1]],cwd=cwd,env={**env,"PYTHONPATH":str(ROOT)},log=log)
 
 
+def source_clip(ffmpeg, path, *, variable):
+    duration = "0.16667" if variable else "0.125"
+    select = ["-vf", r"select=not(eq(n\,1))"] if variable else []
+    subprocess.run([ffmpeg,"-v","error","-f","lavfi","-i",f"testsrc2=size=640x360:rate=24:duration={duration}",
+                    "-f","lavfi","-i",f"sine=frequency=440:sample_rate=44100:duration={duration}",
+                    *select,"-fps_mode","vfr","-frames:v","3","-c:v","mpeg4","-c:a","aac",str(path)],check=True)
+
+
 @unittest.skipUnless(os.environ.get("FILM_WORKER_TEST_SIMULATION")=="1","requires local Blender and media tools")
 class WholeMediaSimulation(unittest.TestCase):
     def wait_work(self, service, worker, work):
@@ -53,6 +62,12 @@ class WholeMediaSimulation(unittest.TestCase):
         self.fail(str(worker.summary()))
 
     def test_http_roundtrip_with_real_blender_1080p_4k_and_audio(self):
+        self.roundtrip(variable=False)
+
+    def test_variable_source_timing_survives_revision_by_another_node_and_4k(self):
+        self.roundtrip(variable=True)
+
+    def roundtrip(self, *, variable):
         with tempfile.TemporaryDirectory(prefix="worker-local-manager-") as directory, mock_service() as service:
             root = Path(directory)
             data = root/"节点 数据"
@@ -66,9 +81,7 @@ class WholeMediaSimulation(unittest.TestCase):
             tools = resolve_tools(config)
             versions = inspect_tools(tools)
             clip = root/"input.mp4"
-            subprocess.run([tools["ffmpeg"],"-v","error","-f","lavfi","-i","testsrc2=size=640x360:rate=24",
-                            "-f","lavfi","-i","sine=frequency=440:sample_rate=44100","-t","0.125",
-                            "-c:v","mpeg4","-c:a","aac",str(clip)],check=True)
+            source_clip(tools["ffmpeg"],clip,variable=variable)
             source = service.store("source_video",clip.read_bytes(),"video/mp4")
             rules = service.store("rules_bundle",archive("test rules"),"application/zip")
             workflow = service.store("workflow_bundle",archive("test workflow"),"application/zip")
@@ -90,6 +103,11 @@ class WholeMediaSimulation(unittest.TestCase):
                     version1 = json.loads(artifacts["version_manifest"])
                     frame1 = version1["frames"][1]
                     timeline = service.outputs_from(first,"source_timeline")
+                    clock = json.loads(artifacts["source_timeline"])
+                    self.assertIs(clock["variable_rate"],variable)
+                    base = Fraction(clock["time_base"])
+                    durations = [Fraction(n,24) for n in ((2,1,1) if variable else (1,1,1))]
+                    self.assertEqual([f["duration_pts"]*base for f in clock["frames"]],durations)
                     self.assertEqual(version1["review_size"],{"width":1920,"height":1080})
                     self.assertEqual(len(version1["frames"]),3)
                     with zipfile.ZipFile(io.BytesIO(artifacts["review_bundle"])) as reviews:
@@ -100,17 +118,28 @@ class WholeMediaSimulation(unittest.TestCase):
                                   timeline_sha256=version1["timeline_sha256"])
                     feedback = dict(status,origin="review",review_size=version1["review_size"],
                                     frames=[dict(number=2,review_signature=frame1["review_signature"],
-                                                note="主体右移",regions=[])])
+                                                note="主体右移",regions=[dict(x=0.3,y=0.64,w=0.4,h=0.3,note="核对主体位置")])])
                     feedback_artifact = service.store("feedback_manifest",json_blob(feedback),"application/json")
                     approve = self.approval(service,version1,status,all_frames=False)
+                    if variable:
+                        node.stop.set()
+                        worker.join(timeout=20)
+                        self.assertFalse(worker.is_alive())
+                        other = root/"另一台节点"
+                        other.mkdir()
+                        node = Scheduler({**config,"node_key":"fixture-handoff"},other,"fixture",test_http=True)
+                        worker = threading.Thread(target=node.run)
+                        worker.start()
                     revised = service.schedule("revise",2,artifacts=[*defaults.values(),*timeline,
                         *service.outputs_from(first,*REFERENCES),feedback_artifact,approve])
                     self.wait_work(service,node,revised)
+                    self.assertEqual(service.workers["fixture"]!=node.session["worker_id"],variable)
+                    self.assertTrue((node.root/"work"/revised/"1/scene/feedback-images/0002.jpg").is_file())
                     new = service.blobs_from(revised)
                     version2 = json.loads(new["version_manifest"])
-                    self.assertNotEqual(version2["frames"][1]["review_signature"],frame1["review_signature"])
-                    for i in (0,2):
-                        self.assertEqual(version1["frames"][i]["review_signature"],version2["frames"][i]["review_signature"])
+                    changes = [before["number"] for before,after in zip(version1["frames"],version2["frames"],strict=True)
+                               if before["review_signature"]!=after["review_signature"]]
+                    self.assertEqual(changes,[2,3] if variable else [2])
                     self.assertEqual(version1["source_sha256"],version2["source_sha256"])
                     self.assertFalse(any(w=="work-finalize" for w in service.completed),"全部通过前不得出片")
                     status.update(base_version=2,base_manifest_sha256=sha(new["version_manifest"]))
@@ -124,6 +153,13 @@ class WholeMediaSimulation(unittest.TestCase):
                     self.assertEqual(receipt["comparison_size"],{"width":3840,"height":4320})
                     self.assertEqual(receipt["verified_review_frames"],3)
                     self.assertTrue(service.replayed[export])
+                    for role in ("white_video","comparison_video"):
+                        output = root/(role+".mp4")
+                        output.write_bytes(result[role])
+                        with patch.dict(os.environ,{"FILM_WORKER_FFPROBE":tools["ffprobe"]}):
+                            _,_,pts,timescale,duration,_ = intake.measure(output)
+                        self.assertEqual([n*timescale for n in pts],[f["pts"]*base for f in clock["frames"]])
+                        self.assertEqual(duration,sum(durations))
                     with zipfile.ZipFile(io.BytesIO(result["delivery_bundle"])) as deliver:
                         self.assertEqual(deliver.read("target/source.mp4"),clip.read_bytes())
                         params=[json.loads(row) for row in deliver.read("meta/video-technical.jsonl").splitlines()]

@@ -37,9 +37,9 @@
 
 模拟服务测试包括双槽位隔离、单单停止、续租重启和同版本重领。重领时核对冻结输入、运行版本和每个输出文件的 SHA-256，再通过新租约上传。文件损坏会重新生成。资格确认和分块回传都使用当前租约。
 
-要验证完整的本机 HTTP 联调，将 `FILM_WORKER_TEST_SIMULATION` 设为 `1`，并准备四个制作工具。执行 `uv run --locked python -m unittest discover -s tests -p test_media_simulation.py -v`。测试用固定的 Blender 场景脚本代替在线模型，跑真实的领单、下载、1080p 首制、原标注员返修、冻结复审批次、4K 编码和交付包回传，验证同一完成回执的重试只归档一次。
+要验证完整的本机 HTTP 联调，将 `FILM_WORKER_TEST_SIMULATION` 设为 `1`，并准备四个制作工具。执行 `uv run --locked python -m unittest discover -s tests -p test_media_simulation.py -v`。测试用固定的 Blender 场景脚本代替在线模型，分别用恒定和可变帧率样片跑领单、下载、1080p 首制、原标注员返修、冻结复审批次、4K 编码和交付包回传，并从成片逐帧读取时间戳和核对总时长。可变帧率用例让同机另一个空数据目录的节点从服务端下载基版和圈选意见，接手返修并核对相邻帧变化。模拟完成回执丢失时，重试只归档一次。
 
-在目标系统运行 `uv run --locked python scripts/verify_portable.py <安装包路径>` 可检查安装包摘要、离线安装、重复启动复用、随包媒体工具和本机面板。GitHub Actions 配置包含原生 Apple Silicon Mac 和 Windows x64 两套运行环境，由 Mac 构建同一源码提交的两套安装包，再分别下载到原生系统运行验收。[运行器架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+在目标系统的源码目录运行 `uv run --locked python scripts/verify_portable.py <安装包路径>` 可检查安装包摘要、离线安装、重复启动复用、随包媒体工具和本机面板。追加 `--simulate` 时用刚安装的执行端和随包 FFmpeg 运行上述两条模拟流程。测试自动发现 Blender 和 Codex，也可用 `FILM_TEST_BLENDER` 和 `FILM_TEST_CODEX` 指定可执行文件。GitHub Actions 配置会在原生 Apple Silicon Mac 和 Windows x64 上分别验证离线安装，Windows 验收还会下载并校验固定版本的 Blender 和 Codex，运行两条模拟流程。[运行器架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) · [Blender 5.2.3 下载摘要](https://download.blender.org/release/Blender5.2/blender-5.2.3.sha256) · [Codex 0.169.1](https://github.com/openai/codex/releases/tag/rust-v0.169.1)
 
 
 ## 附件里的验收要求

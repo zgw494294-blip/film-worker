@@ -32,7 +32,7 @@ jobs:
 
   verify:
     needs: build-distribution
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -57,5 +57,31 @@ jobs:
         with:
           name: worker-${{ matrix.target }}
           path: dist
-      - name: Exercise offline installation, media tools, and the installed panel
+      - name: Exercise offline installation and the installed panel on Mac
+        if: runner.os == 'macOS'
         run: uv run --locked python scripts/verify_portable.py "dist/电影复刻执行端-${{ matrix.target }}.zip"
+      - name: Prepare pinned Blender and Codex for native Windows verification
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $toolRoot = Join-Path $env:RUNNER_TEMP film-worker-test-tools
+          New-Item -ItemType Directory -Path $toolRoot | Out-Null
+          function Expand-PinnedTool($name, $url, $sha256) {
+            $archive = Join-Path $toolRoot "$name.zip"
+            curl.exe --fail --location --retry 3 --max-time 360 --output $archive $url
+            if ($LASTEXITCODE -ne 0 -or (Get-FileHash -Path $archive -Algorithm SHA256).Hash -ne $sha256) {
+              throw "Download or checksum failed for $name"
+            }
+            Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $toolRoot $name)
+          }
+          Expand-PinnedTool blender 'https://download.blender.org/release/Blender5.2/blender-5.2.3-windows-x64.zip' '723f08a4401502561eb763cdeacf8745b31e5f3f154d287d3830d97cf75dc2fb'
+          Expand-PinnedTool codex 'https://github.com/openai/codex/releases/download/rust-v0.169.1/codex-x86_64-pc-windows-msvc.exe.zip' '4214bf9790525aae9f9393c8e8ffa229be0454f9fa2ce103b4cb2012ad74bc40'
+          $blender = Get-ChildItem -Path (Join-Path $toolRoot blender) -File -Filter blender.exe -Recurse | Select-Object -First 1
+          $codex = Get-ChildItem -Path (Join-Path $toolRoot codex) -File -Recurse |
+            Where-Object { $_.Name -in @('codex.exe', 'codex-x86_64-pc-windows-msvc.exe') } | Select-Object -First 1
+          if (!$blender -or !$codex) { throw 'Could not locate the native Windows tools' }
+          "FILM_TEST_BLENDER=$($blender.FullName)" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+          "FILM_TEST_CODEX=$($codex.FullName)" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+      - name: Verify the installed Windows bundle through 1080p review and 4K export
+        if: runner.os == 'Windows'
+        run: uv run --locked python scripts/verify_portable.py "dist/电影复刻执行端-${{ matrix.target }}.zip" --simulate

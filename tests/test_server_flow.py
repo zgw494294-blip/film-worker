@@ -48,6 +48,7 @@ class ProductionMock(ThreadingHTTPServer):
                             review_portrait_limit={"width":1080,"height":1920})
         self.profile["profile_hash"] = object_hash(self.profile)
         self.registered = []
+        self.workers = {}
         self.queue = []
         self.attempts = {}
         self.claims = {}
@@ -134,14 +135,20 @@ class Fixture(BaseHTTPRequestHandler):
         with server.mutex:
             if path=="workers/register":
                 server.registered.append(payload)
-                return self.answer(200, dict(worker_id="node", server_time=now(), heartbeat_seconds=30,
+                worker = server.workers.setdefault(payload["node_key"],f"node-{len(server.workers)+1}")
+                return self.answer(200, dict(worker_id=worker, server_time=now(), heartbeat_seconds=30,
                                             claim_wait_max_seconds=25, lease_seconds=90, lease_heartbeat_seconds=server.heartbeat_interval,
                                             part_size_bytes=8388608))
-            if path=="workers/node/heartbeat":
+            if path.startswith("workers/") and path.endswith("/heartbeat") and path.split("/")[1] in server.workers.values():
                 return self.answer(200, dict(server_time=now(), accept_claims=True))
             if path=="work/claim":
+                if payload["worker_id"] not in server.workers.values():
+                    return self.answer(403,{"code":"worker_unknown"})
                 if token not in server.claims:
-                    server.claims[token] = server.queue.pop(0) if server.queue else None
+                    assignment = server.queue.pop(0) if server.queue else None
+                    if assignment:
+                        assignment["lease"]["worker_id"] = payload["worker_id"]
+                    server.claims[token] = assignment
                 assignment = server.claims[token]
                 if assignment:
                     server.attempts[assignment["work_id"]]["state"] = "leased"

@@ -18,7 +18,7 @@ def digest(path):
         return hashlib.file_digest(file, "sha256").hexdigest()
 
 
-def verify(path):
+def verify(path, *, simulate=False):
     expected = path.with_suffix(".zip.sha256").read_text(encoding="utf-8").split()[0]
     if digest(path) != expected:
         raise ValueError("发布包摘要不符")
@@ -47,7 +47,9 @@ def verify(path):
                              capture_output=True,encoding="utf-8",check=True,timeout=15)
         if marker.stat().st_mtime_ns != since or Path(out.stdout.strip()) != python:
             raise ValueError("第二次安装未复用第一次下载结果")
-        launcher = [str(python), "-X", "utf8", "-m", "film_worker", "--data", str(data), "launch", "--background"]
+        pythonw = python.with_name("pythonw.exe")
+        background_python = pythonw if os.name=="nt" and pythonw.is_file() else python
+        launcher = [str(background_python), "-X", "utf8", "-m", "film_worker", "--data", str(data), "launch", "--background"]
         env.pop("FILM_WORKER_BUNDLED_TOOLS", None)
         env.pop("FILM_WORKER_UV", None)
         startup_log = data/"logs/startup.log"
@@ -67,6 +69,14 @@ def verify(path):
                     else:
                         os.killpg(child.pid,signal.SIGINT)
                     child.wait(timeout=15)
+        if simulate:
+            tools = marker.parent/"tools"
+            suffix = ".exe" if os.name=="nt" else ""
+            tests = Path(__file__).resolve().parent.parent/"tests"
+            env.update(FILM_WORKER_TEST_SIMULATION="1", FILM_TEST_FFMPEG=str(tools/("ffmpeg"+suffix)),
+                       FILM_TEST_FFPROBE=str(tools/("ffprobe"+suffix)))
+            subprocess.run([str(python),"-m","unittest","discover","-s",str(tests),
+                            "-p","test_media_simulation.py","-v"],cwd=project,env=env,check=True,timeout=300)
 
 
 def verify_media_tools(tools, temp, env):
@@ -109,5 +119,7 @@ def wait_for_panel(child, startup_log, log):
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("zip",type=Path)
-    verify(parser.parse_args().zip)
+    parser.add_argument("--simulate",action="store_true",help="Run CFR and VFR mock-manager tests from the installed bundle")
+    args = parser.parse_args()
+    verify(args.zip,simulate=args.simulate)
     print("verified offline install, cache reuse and background control panel")

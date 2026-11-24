@@ -111,7 +111,7 @@ s.frame_start = 1
 s.frame_end = {worker.count}
 if not {preparing!r}:
     subject = bpy.data.objects["Cube"]
-    for frame, x in ((1, 0), (2, 1), (3, 0)):
+    for frame, x in ((1, 0), (2, 1), (3, {int(worker.timeline["variable_rate"])})):
         subject.location.x = x
         subject.keyframe_insert(data_path="location", frame=frame)
 bpy.context.preferences.filepaths.save_version = 0
