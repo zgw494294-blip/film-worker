@@ -140,7 +140,10 @@ class ProcessTests(unittest.TestCase):
 from pathlib import Path
 if os.name != "nt":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-Path(sys.argv[1]).touch()
+ready = Path(sys.argv[1])
+pending = ready.with_suffix('.tmp')
+pending.write_text(str(os.getpid()), encoding='ascii')
+pending.replace(ready)
 deadline = time.monotonic() + 15
 while time.monotonic() < deadline:
     if Path(sys.argv[2]).exists():
@@ -162,6 +165,11 @@ if os.read(sys.stdin.fileno(),1)==b"1":
                     while not ready.exists() and time.monotonic()<deadline:
                         time.sleep(0.05)
                     self.assertTrue(ready.exists())
+                    if os.name == "nt":
+                        import win32job
+
+                        members = win32job.QueryInformationJobObject(tree.job, win32job.JobObjectBasicProcessIdList)
+                        self.assertIn(int(ready.read_text(encoding="ascii")), members)
                 finally:
                     tree.close()
                 check_survival.touch()

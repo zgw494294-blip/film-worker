@@ -2,7 +2,6 @@
 import json
 import os
 import plistlib
-import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +13,7 @@ from pathlib import Path
 
 from film_worker import startup
 from film_worker.panel import update_allowed
+from film_worker.processes import ProcessTree
 from film_worker.settings import DEFAULTS, ROOT, validate_config
 
 
@@ -67,8 +67,9 @@ class StartupTests(unittest.TestCase):
             for field in ("FILM_WORKER_LAUNCH","FILM_WORKER_BOOTSTRAP","FILM_WORKER_BOOTSTRAP_PYTHON","FILM_WORKER_RELEASE"):
                 env.pop(field,None)
             argv = [sys.executable,"-m","film_worker","--data",str(root),"launch","--background"]
-            child = subprocess.Popen(argv,cwd=ROOT,env=env,start_new_session=os.name!="nt",
-                                     stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            with (Path(directory)/"launcher.log").open("wb") as output:
+                tree = ProcessTree(argv,cwd=ROOT,env=env,log=output)
+            child = tree.child
             try:
                 end = time.monotonic()+55
                 while child.poll() is None and not startup.running_panel(root) and time.monotonic()<end:
@@ -84,12 +85,7 @@ class StartupTests(unittest.TestCase):
                     self.assertEqual(json.load(handle),address)
                 self.assertIn(endpoint,log.read_text(encoding="utf-8"))
             finally:
-                if child.poll() is None:
-                    if os.name=="nt":
-                        subprocess.run(["taskkill","/F","/T","/PID",str(child.pid)],capture_output=True,timeout=15)
-                    else:
-                        os.killpg(child.pid,signal.SIGINT)
-                    child.wait(timeout=15)
+                tree.close()
 
     def test_update_window_supports_midnight_and_legacy_all_day(self):
         def when(hour,minute):
