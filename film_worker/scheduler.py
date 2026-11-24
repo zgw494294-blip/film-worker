@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .processes import ProcessTree
-from .protocol import Client, Interrupted, ProtocolError, Transfer, digest, key, opaque
+from .protocol import Client, Interrupted, ProtocolError, Transfer, digest, key, opaque, valid_digest
 from .settings import KINDS, ROOT, atomic_json, environment, inspect_tools, object_hash, profile_matches, registration, resolve_tools
 from .state import State, identity, slot
 
@@ -339,25 +339,50 @@ class Scheduler:
         # Query one prior work per job. Old work terminal is distinct from job delivery.
         with self.lock:
             active = set(self.active)
-        jobs = set()
+        assignments = {}
+        latest = {}
         for row in self.state.rows():
-            if (row["work"], row["number"]) in active or row["status"] == "active":
-                continue
             assignment = json.loads(row["assignment"])
             job = assignment["job_id"]
-            if job in jobs or len(jobs) >= 8 or (time.monotonic() - self.staleness.get(job, -3600)) < 120:
+            assignments.setdefault(job, []).append(assignment)
+            if (row["work"], row["number"]) in active or row["status"] == "active":
                 continue
-            jobs.add(job)
+            latest.setdefault(job, assignment)
+        due = sorted(latest, key=lambda job: self.staleness.get(job, -3600))
+        for job in due[:8]:
+            if time.monotonic() - self.staleness.get(job, -3600) < 120:
+                break
+            self.staleness[job] = time.monotonic()
             try:
-                result = self.work_status(assignment)
+                result = self.work_status(latest[job])
             except ProtocolError as exc:
                 if exc.status == 404:
                     continue
                 raise
-            self.staleness[job] = time.monotonic()
             self.state.set("job:" + job, result)
-            if result["job_state"] == "deleted":
-                shutil.rmtree(self.root / "work" / opaque(assignment["work_id"]), ignore_errors=True)
+            if result["job_state"] == "deleted" and not any(identity(a) in active for a in assignments[job]):
+                self.prune_deleted(job, assignments)
+
+    def prune_deleted(self, job, assignments):
+        def hashes(records):
+            return {valid_digest(item["sha256"]) for a in records for item in a["input_manifest"]["artifacts"]}
+
+        records = assignments[job]
+        protected = set()
+        for other_job, others in assignments.items():
+            if other_job == job:
+                continue
+            status = self.state.setting("job:" + other_job)
+            if not status or status["job_state"] != "deleted":
+                protected.update(hashes(others))
+        for sha in hashes(records) - protected:
+            try:
+                (self.root / "cache/sha256" / sha).unlink(missing_ok=True)
+            except PermissionError:
+                # A Windows file may still be open. A later reconciliation retries cleanup.
+                pass
+        for work in {opaque(a["work_id"]) for a in records}:
+            shutil.rmtree(self.root / "work" / work, ignore_errors=True)
 
     def execute(self, assignment, deadline, heartbeat_seconds, current, pending):
         try:
@@ -384,6 +409,10 @@ class Scheduler:
                         profile, artifacts = self.check_assignment(assignment)
                         checkpoint = self.load_checkpoint(assignment, directory, transfer.stop)
                         if checkpoint is None:
+                            if (directory.parent / "outputs.json").exists():
+                                # An existing checkpoint failed verification. Ask the media
+                                # runner to recreate the output set from its validated inputs.
+                                (directory / "result.json").unlink(missing_ok=True)
                             report("download")
                             with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
                                 paths = {role: str(transfer.download(artifact, directory)) for role, artifact in artifacts.items()}

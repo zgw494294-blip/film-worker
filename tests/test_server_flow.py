@@ -57,6 +57,8 @@ class ProductionMock(ThreadingHTTPServer):
         self.completed = []
         self.commit_calls = {}
         self.hold_commits = set()
+        self.hold_uploads = set()
+        self.upload_calls = set()
         self.stop_work = {}
         self.heartbeat_interval = 20
 
@@ -139,7 +141,7 @@ class Fixture(BaseHTTPRequestHandler):
                               directive=server.stop_work.get(work, "continue"),current_version=version,
                               delivery_versions=[2] if delivered else [],terminal=state in {"succeeded","stopped","deleted"},
                               server_time=now())
-                if "receipt" in attempt:
+                if "receipt" in attempt and state != "deleted":
                     result["receipt"] = attempt["receipt"]
                 return self.answer(200, result)
             if path.startswith("artifacts/"):
@@ -187,6 +189,9 @@ class Fixture(BaseHTTPRequestHandler):
                 history[seq] = event
             return self.answer(200, {"accepted_through":len(history)})
         if command=="uploads":
+            server.upload_calls.add(work)
+            if work in server.hold_uploads:
+                return self.answer(503, {"code":"unavailable", "retryable":True})
             upload_id = f"up-{work}-{lease['attempt']}-{payload['role']}"
             if upload_id not in server.uploads:
                 server.uploads[upload_id] = dict(payload,upload_id=upload_id,work_id=work,state="open",
@@ -352,6 +357,68 @@ class WorkerFlow(unittest.TestCase):
                         self.assertNotEqual(calls[0][1],calls[-1][1])
                         self.assertEqual([a["sha256"] for a in calls[0][2]["outputs"]],
                                          [a["sha256"] for a in calls[-1][2]["outputs"]])
+
+    def test_server_stop_during_first_confirmation_prevents_production(self):
+        with tempfile.TemporaryDirectory(prefix="worker-fenced-") as folder, mock_service() as service:
+            work = service.schedule("prepare",1)
+            service.stop_work[work] = "stop"
+
+            def unexpected(*_):
+                self.fail("production started before lease confirmation")
+
+            with node_running(node_config(service),Path(folder),unexpected) as node:
+                self.wait_for(lambda: any(row["status"]=="interrupted" for row in node.state.rows()),node)
+                self.assertNotIn(work,service.upload_calls)
+                self.assertNotIn(work,service.commit_calls)
+
+    def test_corrupt_result_on_restart_is_regenerated_before_upload(self):
+        with tempfile.TemporaryDirectory(prefix="worker-corrupt-") as folder, mock_service() as service:
+            root = Path(folder)
+            work = service.schedule("prepare",1)
+            service.hold_uploads.add(work)
+            config = node_config(service)
+            with node_running(config,root,fixture_outputs) as node:
+                self.wait_for(lambda:work in service.upload_calls,node)
+                self.assertIsNone(node.state.rows()[0]["pending"])
+            file = root/"work"/work/"1/scene_bundle.bin"
+            file.write_bytes(b"!"*file.stat().st_size)
+            with service.mutex:
+                service.hold_uploads.remove(work)
+
+            def recreate(node,assignment,profile,paths,directory,transfer,progress):
+                self.assertFalse((directory/"result.json").exists())
+                return fixture_outputs(node,assignment,profile,paths,directory,transfer,progress)
+
+            with node_running(config,root,recreate) as node:
+                self.wait_for(lambda:service.completed == [work],node)
+                submitted = next(a for a in service.commit_calls[work][0][2]["outputs"] if a["role"]=="scene_bundle")
+                self.assertEqual(submitted["sha256"], sha(b"scene_bundleprepare"))
+
+    def test_deleted_job_cleans_all_work_without_removing_shared_input(self):
+        with tempfile.TemporaryDirectory(prefix="worker-delete-") as folder, mock_service() as service:
+            root = Path(folder)
+            first = service.schedule("prepare",1,slug="a-first",job="job-a")
+            revised = service.schedule("revise",2,slug="a-revise",job="job-a")
+            other = service.schedule("prepare",1,slug="b-first",job="job-b")
+            with node_running(node_config(service),root,fixture_outputs) as node:
+                self.wait_for(lambda:len(node.state.rows())==3 and all(
+                    row["status"]=="succeeded" for row in node.state.rows()),node)
+                shared = root/"cache"/"sha256"/sha(service.input)
+                self.assertTrue(shared.is_file())
+                with service.mutex:
+                    service.attempts[first]["state"] = "deleted"
+                    service.attempts[revised]["state"] = "deleted"
+                node.staleness.clear()
+                node.reconcile()
+                self.assertFalse((root/"work"/first).exists())
+                self.assertFalse((root/"work"/revised).exists())
+                self.assertTrue((root/"work"/other).exists())
+                self.assertTrue(shared.is_file())
+                with service.mutex:
+                    service.attempts[other]["state"] = "deleted"
+                node.staleness.pop("job-b",None)
+                node.reconcile()
+                self.assertFalse(shared.exists())
 
     def wait_for(self, condition, node):
         limit=time.monotonic()+12
