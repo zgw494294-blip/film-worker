@@ -344,8 +344,11 @@ class WorkerFlow(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="worker-local-review-") as folder, mock_service() as service, patch(
                 "film_worker.scheduler.resolve_tools", return_value={}), patch(
                 "film_worker.scheduler.inspect_tools", return_value=VERSIONS):
-            owner = Scheduler(node_config(service), Path(folder)/"owner", "fixture", test_http=True)
-            other = Scheduler(node_config(service), Path(folder)/"other", "fixture", test_http=True)
+            owner_data, other_data = Path(folder)/"owner", Path(folder)/"other"
+            owner_data.mkdir()
+            other_data.mkdir()
+            owner = Scheduler(node_config(service), owner_data, "fixture", test_http=True)
+            other = Scheduler(node_config(service), other_data, "fixture", test_http=True)
             try:
                 storage = {"mode": LOCAL_REVIEW_MODE, "instance_id": owner.instance_id}
                 work = service.schedule("prepare", 1, review_storage=storage)
