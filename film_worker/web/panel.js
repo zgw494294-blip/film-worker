@@ -19,7 +19,7 @@ async function api(path, body) {
   return data;
 }
 
-const stateNames = {connected: "服务已连接", stopped: "未运行", connecting: "正在连接", network_unavailable: "网络不可用", configuration_error: "配置需处理"};
+const stateNames = {connected: "服务已连接", stopped: "未运行", connecting: "正在连接", network_unavailable: "网络不可用", configuration_error: "配置需处理", tls_verification_failed: "服务端证书验证失败", invalid_token: "建模 Token 无效", forbidden: "设备信息不匹配", instance_bound: "设备绑定到其他实例", instance_busy: "设备正在被其他实例使用"};
 const stages = {download: "正在下载输入", codex_author: "Codex 制作", prepare_source: "抽取原片帧", compare_review: "生成对比图", verify_review: "核对审核签名"};
 
 async function refresh() {
@@ -56,7 +56,8 @@ async function refresh() {
     const recent = (state.history ?? []).map(item => {
       const line = document.createElement("li");
       const transfer = item.delivery_versions.length ? ` · 已交付版 ${item.delivery_versions.join("、")}` : "";
-      line.textContent = `${item.job_id} · ${item.kind} · ${item.job_state ?? item.status}${transfer}`;
+      line.textContent = `${item.job_id} · ${item.kind} · ${item.job_state ?? item.status}${transfer}` +
+        (item.message ? ` · ${item.message}` : "");
       return line;
     });
     document.querySelector("#history").replaceChildren(...recent);

@@ -6,23 +6,26 @@ import http.client
 import json
 import re
 import socket
+import ssl
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 
 REVIEW_STORAGE_HEADER = "X-Film-Worker-Review-Storage"
+STORAGE_HEARTBEAT_HEADER = "X-Film-Worker-Storage"
 LOCAL_REVIEW_MODE = "node_local_v1"
 
 
 class ProtocolError(Exception):
-    def __init__(self, status, code, retryable=False, retry_after=None):
-        super().__init__(f"HTTP {status}: {code}")
+    def __init__(self, status, code, retryable=False, retry_after=None, *, detail=None):
+        super().__init__(f"HTTP {status}: {code}" + (f" · {detail}" if detail else ""))
         self.status = status
         self.code = code
         self.retryable = retryable
         self.retry_after = retry_after
+        self.detail = detail
 
 
 class Interrupted(Exception):
@@ -56,7 +59,7 @@ def key(*values):
 
 
 class Client:
-    def __init__(self, server, token, *, test_http=False):
+    def __init__(self, server, token, *, test_http=False, server_ca_file=""):
         parsed = urlsplit(server)
         local = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
         if (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
@@ -67,7 +70,15 @@ class Client:
         if not self.base.endswith("/api/v1"):
             self.base += "/api/v1"
         self.token = token
-        self.opener = build_opener(NoRedirects())
+        handlers = [NoRedirects()]
+        if server_ca_file:
+            try:
+                context = ssl.create_default_context()
+                context.load_verify_locations(cafile=Path(server_ca_file).expanduser())
+            except (OSError, ValueError) as exc:
+                raise ValueError("无法加载所配置的服务端 PEM 证书") from exc
+            handlers.append(HTTPSHandler(context=context))
+        self.opener = build_opener(*handlers)
 
     def open(self, method, path, *, body=None, headers=None, timeout=12):
         request_headers = {"Authorization": "Bearer " + self.token, **(headers or {})}
@@ -89,15 +100,26 @@ class Client:
                 code = error.get("code", "request_rejected")
                 if not isinstance(code, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", code):
                     code = "request_rejected"
+                detail = error.get("message")
+                if not isinstance(detail, str):
+                    detail = ""
+                if self.token:
+                    detail = detail.replace(self.token, "[已隐藏]")
+                detail = " ".join(detail.split())[:600]
                 raise ProtocolError(response.code, code, response.code in {408, 429, 500, 502, 503, 504}
                                     or error.get("retryable") is True,
-                                    int(retry_after) if retry_after.isdecimal() else None) from None
-        except (URLError, socket.timeout, ConnectionError, http.client.HTTPException):
+                                    int(retry_after) if retry_after.isdecimal() else None, detail=detail) from None
+        except (URLError, socket.timeout, ConnectionError, http.client.HTTPException) as exc:
+            if isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+                raise ProtocolError(0, "tls_verification_failed",
+                                    detail="请核对 HTTPS 地址与证书名称，并配置受信任的服务端 PEM 证书") from None
             raise ProtocolError(0, "network_unavailable", True) from None
 
-    def json(self, method, path, *, body=None, headers=None, timeout=12):
+    def json(self, method, path, *, body=None, headers=None, timeout=12, response_headers=None):
         try:
             with self.open(method, path, body=body, headers=headers, timeout=timeout) as response:
+                if response_headers is not None:
+                    response_headers.update((name.lower(), value) for name, value in response.headers.items())
                 wait = response.headers.get("Retry-After", "")
                 if response.status == 204:
                     return None, int(wait) if wait.isdecimal() else 3

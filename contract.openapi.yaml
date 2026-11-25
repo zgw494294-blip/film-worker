@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: 电影复刻 · 建模执行端接口
-  version: 1.1.0
+  version: 1.1.1
   description: '公网管理端提供的 HTTPS 出站拉取协议。服务端权威保存作业、版本、审批、工件和交付。建模节点只需访问一个管理端地址，以节点令牌领取、续租、上报和回传。节点合同与管理端 UI 用户接口独立。
 
     建模执行端运行在 Mac 上。下列标识、角色、路径、状态、哈希算法及字节范围用于管理端与各台 Mac 之间互操作。工件清单中的 JSON 是 UTF-8 文件；普通工件哈希针对实际文件字节，明确标有 JCS 的字段才对规范化 JSON 计算哈希。HTTP
@@ -19,7 +19,7 @@ tags:
 - name: 工作
 - name: 工件
 x-operational-contract:
-  授权: 建模令牌由管理端预发或轮换，node_key 为兼容旧服务的可选字段。所有操作验证 Bearer 和节点、工单归属。节点侧供应商及模型登录由节点自己配置，不随建模令牌、能力快照、事件、日志或工件上传。撤销令牌应立即拒绝新请求。
+  授权: 建模令牌由管理端预发或轮换，movie-review 要求 node_key 与令牌对应的设备一致。所有操作验证 Bearer 和节点、工单归属。节点侧供应商及模型登录由节点自己配置，不随建模令牌、能力快照、事件、日志或工件上传。撤销令牌应立即拒绝新请求。
   租约: attempt 对同一工作从 1 递增，重分派同时提升 fence，撤销旧租约。节点自身的并发上限由 slots 提示并由服务端原子限制。管理端时间为准，服务端对持租写验核 worker、lease_id、fence、attempt、终态与控制状态；上报进度、传分段、上传完成均不自动续租。工作心跳与长任务、上传并行执行。发生状态冲突后节点查询
     status，再处置本地缓存。
   重放: Idempotency-Key 的记录以令牌稳定主体、操作/目标资源和幂等键隔离，保留原响应及请求哈希。请求摘要是规范化正文以及资源/相关租约头的不可变身份摘要。相同键同内容复用原响应，不同内容返回 409。Complete
@@ -115,6 +115,11 @@ paths:
       responses:
         '200':
           description: 已注册，领取参数由服务端返回。
+          headers:
+            X-Film-Worker-Storage:
+              description: 值为 1 时，设备心跳可上报磁盘容量。
+              schema:
+                const: '1'
           content:
             application/json:
               schema:
@@ -1190,6 +1195,7 @@ components:
       type: object
       additionalProperties: false
       required:
+      - node_key
       - instance_id
       - capabilities
       properties:
@@ -1203,7 +1209,7 @@ components:
           minLength: 1
         capabilities:
           $ref: '#/components/schemas/Capabilities'
-      description: Bearer Token 确定节点身份。旧服务提供 node_key 时须匹配 Token。instance_id 是执行端稳定记录的实例标识。
+      description: node_key 填写服务端提供的设备标识，须与 Bearer Token 匹配。instance_id 是执行端稳定记录的实例标识。
     WorkerSession:
       type: object
       additionalProperties: false
@@ -1251,6 +1257,18 @@ components:
             $ref: '#/components/schemas/ID'
           minItems: 0
           uniqueItems: true
+        storage:
+          type: object
+          additionalProperties: false
+          required: [free_bytes, reserve_bytes]
+          properties:
+            free_bytes:
+              type: integer
+              minimum: 0
+            reserve_bytes:
+              type: integer
+              minimum: 0
+          description: 注册响应头允许时上报。低于预留值时 available_slots 为 0。
       description: 节点心跳只报告可用性。独立的工作心跳负责续租每一项任务。
     WorkerHeartbeatAck:
       type: object
@@ -1397,7 +1415,7 @@ components:
             $ref: '#/components/schemas/Artifact'
           minItems: 1
       description: >-
-        每个角色仅一份。prepare 基版为 null，目标为 1。revise 目标为基版加一。finalize 目标为基版。
+        每个角色仅一份。prepare 基版为 null，目标为 1。revise 目标为当前审核版加一，补审返修的 base_version 指向原制作版。finalize 目标为基版。
         有 review_storage 的作业只向绑定实例发放，返修和出片从本机读取审片 ZIP 与工程。
         服务端保证关联同一作业和基版。节点校验工件摘要、作业身份及时间线。
       allOf:

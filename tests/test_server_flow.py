@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from film_worker.protocol import Interrupted, LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER
+from film_worker.protocol import Interrupted, LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER, STORAGE_HEARTBEAT_HEADER
 from film_worker.scheduler import Scheduler, WorkFailure
 from film_worker.settings import DEFAULTS, atomic_json, environment, object_hash
 
@@ -48,6 +48,8 @@ class ProductionMock(ThreadingHTTPServer):
                             review_portrait_limit={"width":1080,"height":1920})
         self.profile["profile_hash"] = object_hash(self.profile)
         self.registered = []
+        self.advertise_disk_capacity = False
+        self.heartbeats = []
         self.review_storage = {}
         self.workers = {}
         self.queue = []
@@ -61,6 +63,7 @@ class ProductionMock(ThreadingHTTPServer):
         self.completed = []
         self.commit_calls = {}
         self.hold_commits = set()
+        self.reject_commits = {}
         self.hold_uploads = set()
         self.upload_calls = set()
         self.stop_work = {}
@@ -145,10 +148,12 @@ class Fixture(BaseHTTPRequestHandler):
                 server.registered.append(payload)
                 worker = server.workers.setdefault(payload.get("node_key", "bearer-node"),f"node-{len(server.workers)+1}")
                 server.review_storage[worker,payload["instance_id"]] = self.headers.get(REVIEW_STORAGE_HEADER)
+                advertised = {STORAGE_HEARTBEAT_HEADER: "1"} if server.advertise_disk_capacity else {}
                 return self.answer(200, dict(worker_id=worker, server_time=now(), heartbeat_seconds=30,
                                             claim_wait_max_seconds=25, lease_seconds=90, lease_heartbeat_seconds=server.heartbeat_interval,
-                                            part_size_bytes=8388608))
+                                            part_size_bytes=8388608), **advertised)
             if path.startswith("workers/") and path.endswith("/heartbeat") and path.split("/")[1] in server.workers.values():
+                server.heartbeats.append(payload)
                 return self.answer(200, dict(server_time=now(), accept_claims=True))
             if path=="work/claim":
                 if payload["worker_id"] not in server.workers.values():
@@ -267,6 +272,8 @@ class Fixture(BaseHTTPRequestHandler):
             server.commit_calls.setdefault(work, []).append((lease["attempt"], token, payload))
             if work in server.hold_commits:
                 return self.answer(503, {"code":"unavailable", "retryable":True})
+            if work in server.reject_commits:
+                return self.answer(422, {"code":"invalid_request", "message":server.reject_commits[work]})
             roles = set(ROLES[kind])
             if "review_storage" in attempt["assignment"]["input_manifest"]:
                 roles.discard("scene_bundle")
@@ -340,6 +347,27 @@ def fixture_outputs(node, assignment, profile, paths, directory, transfer, progr
 
 
 class WorkerFlow(unittest.TestCase):
+    def test_heartbeat_reports_disk_capacity_after_server_advertises_support(self):
+        storage = {"free_bytes": 100, "reserve_bytes": 200}
+        for advertised in (True, False):
+            with self.subTest(advertised=advertised), tempfile.TemporaryDirectory() as folder, mock_service() as service:
+                service.advertise_disk_capacity = advertised
+                with patch.object(Scheduler, "disk_capacity", return_value=storage), node_running(
+                        node_config(service), Path(folder), fixture_outputs) as node:
+                    self.wait_for(lambda: bool(service.heartbeats), node)
+                    heartbeat = service.heartbeats[-1]
+                    self.assertEqual(heartbeat["available_slots"], 0)
+                    self.assertEqual(heartbeat.get("storage"), storage if advertised else None)
+
+    def test_rejected_output_closes_attempt_with_server_message(self):
+        with tempfile.TemporaryDirectory() as folder, mock_service() as service:
+            work = service.schedule("prepare", 1)
+            service.reject_commits[work] = "审核图超过平台大小限制"
+            with node_running(node_config(service), Path(folder), fixture_outputs) as node:
+                self.wait_for(lambda: node.state.rows() and node.state.rows()[0]["status"] == "failed", node)
+                self.assertEqual(service.attempts[work]["error"]["code"], "input_invalid")
+                self.assertIn(service.reject_commits[work], node.state.rows()[0]["message"])
+
     def test_local_review_rejects_wrong_instance_and_missing_frozen_version(self):
         with tempfile.TemporaryDirectory(prefix="worker-local-review-") as folder, mock_service() as service, patch(
                 "film_worker.scheduler.resolve_tools", return_value={}), patch(

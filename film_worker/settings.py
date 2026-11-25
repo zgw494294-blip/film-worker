@@ -22,6 +22,7 @@ MODEL_FIELDS = ("codex_model", "codex_provider", "reasoning_effort")
 
 DEFAULTS = {
     "server": "",
+    "server_ca_file": "",
     "node_key": "",
     "display_name": platform.node(),
     "slots": 1,
@@ -99,7 +100,7 @@ def validate_config(settings):
     interval = config["update_interval_minutes"]
     if type(interval) is not int or not 1 <= interval <= 1440 or type(config["auto_update"]) is not bool:
         raise ValueError("更新周期须为 1–1440 分钟")
-    for field in ("server", "node_key", "display_name", "codex", "blender", "ffmpeg", "ffprobe",
+    for field in ("server", "server_ca_file", "node_key", "display_name", "codex", "blender", "ffmpeg", "ffprobe",
                   "update_remote", "update_tag", "update_signers", "update_window_start", "update_window_end",
                   *MODEL_FIELDS):
         if not isinstance(config[field], str) or "\0" in config[field]:

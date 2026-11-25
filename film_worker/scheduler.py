@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import bundles
 from .processes import ProcessTree
-from .protocol import (LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER, Client, Interrupted, ProtocolError,
+from .protocol import (LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER, STORAGE_HEARTBEAT_HEADER, Client, Interrupted, ProtocolError,
                        Transfer, digest, key, opaque, valid_digest)
 from .settings import (KINDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
                        production_settings, registration, resolve_tools, validate_config)
@@ -137,7 +137,7 @@ class Scheduler:
         self.cfg = config
         self.root = root
         self.state = State(root)
-        self.api = Client(config["server"], token, test_http=test_http)
+        self.api = Client(config["server"], token, test_http=test_http, server_ca_file=config.get("server_ca_file", ""))
         self.tools = resolve_tools(config)
         self.versions = inspect_tools(self.tools)
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=config["slots"])
@@ -149,6 +149,7 @@ class Scheduler:
         self.staleness = {}
         self.status = dict(connection="connecting", last_success=None)
         self.session = {}
+        self.storage_heartbeat = False
         scope = key(config["server"], config["node_key"])
         previous = self.state.setting("node_instance")
         if previous and previous["scope"] == scope:
@@ -194,6 +195,7 @@ class Scheduler:
         heartbeat_at = 0
         next_reconcile = 0
         accept = True
+        register_key = None
         try:
             while not self.stop.is_set():
                 with self.lock:
@@ -203,18 +205,28 @@ class Scheduler:
                     if not self.session:
                         payload = registration(self.cfg, self.instance_id, self.versions)
                         self.work_kinds = payload["capabilities"]["work_kinds"]
+                        response_headers = {}
+                        register_key = register_key or str(uuid.uuid4())
                         self.session, _ = self.api.json("POST", "/workers/register", body=payload,
-                                                         headers={"Idempotency-Key": key(self.instance_id, payload, LOCAL_REVIEW_MODE),
-                                                                  REVIEW_STORAGE_HEADER: LOCAL_REVIEW_MODE})
+                                                         headers={"Idempotency-Key": register_key,
+                                                                  REVIEW_STORAGE_HEADER: LOCAL_REVIEW_MODE},
+                                                         response_headers=response_headers)
+                        register_key = None
+                        self.storage_heartbeat = response_headers.get(STORAGE_HEARTBEAT_HEADER.lower()) == "1"
+                        heartbeat_at = 0
                         self.recover()
                     now = time.monotonic()
                     with self.lock:
                         ids = [w for w, n in self.active]
+                    disk = self.disk_capacity()
+                    enough = disk["free_bytes"] >= disk["reserve_bytes"]
                     if now >= heartbeat_at:
                         body = dict(instance_id=self.instance_id, available_slots=max(0, self.cfg["slots"]-len(ids)),
                                     active_work_ids=ids)
-                        if self.drain.is_set():
+                        if self.drain.is_set() or not enough:
                             body["available_slots"] = 0
+                        if self.storage_heartbeat:
+                            body["storage"] = disk
                         answer, _ = self.api.json("POST", f"/workers/{opaque(self.session['worker_id'])}/heartbeat", body=body)
                         accept = answer["accept_claims"]
                         heartbeat_at = now + self.session["heartbeat_seconds"]
@@ -225,7 +237,6 @@ class Scheduler:
                         next_reconcile = time.monotonic() + 60
                     with self.lock:
                         free = self.cfg["slots"] - len(self.active)
-                    enough = shutil.disk_usage(self.root).free >= self.cfg["disk_reserve_gib"] * 1024**3
                     if accept and enough and free > 0 and now >= next_poll and not (
                             self.drain.is_set() or self.stop_after_drain.is_set()):
                         wait = self.claim()
@@ -233,9 +244,11 @@ class Scheduler:
                     retry = 1
                     self.stop.wait(0.25)
                 except ProtocolError as exc:
-                    self.note(exc.code)
+                    self.note(exc.code, detail=exc.detail)
                     if exc.status in (401, 403, 404) or exc.code == "worker_unknown":
                         self.session = {}
+                        if exc.code == "worker_unknown":
+                            register_key = None
                     self.stop.wait(max(retry, min(exc.retry_after or 0, 60)))
                     retry = min(30, retry * 2)
                 except ValueError as exc:
@@ -249,6 +262,9 @@ class Scheduler:
                 for active in self.active.values():
                     active["stop"].set()
             self.pool.shutdown(wait=True, cancel_futures=True)
+
+    def disk_capacity(self):
+        return {"free_bytes": shutil.disk_usage(self.root).free, "reserve_bytes": self.cfg["disk_reserve_gib"] * 1024**3}
 
     def claim(self):
         pending = self.state.setting("claim")
@@ -475,8 +491,13 @@ class Scheduler:
                     events.send(dict(stage="commit_result", completed=0, total=None))
                     receipt = transfer.json("POST", f"/work/{transfer.work}/complete", pending, "complete")
                     self.state.mark(assignment, status="succeeded", receipt=receipt)
-                except (ValueError, KeyError, OSError, RuntimeError) as exc:
-                    if not isinstance(exc, WorkFailure):
+                except (ValueError, KeyError, OSError, RuntimeError, ProtocolError) as exc:
+                    if isinstance(exc, ProtocolError):
+                        if exc.status not in {400, 413, 415, 416, 422}:
+                            raise
+                        message = f"{progress()['stage']} · {exc.detail or exc.code}"
+                        error = dict(code="input_invalid", message=message, retryable=False)
+                    elif not isinstance(exc, WorkFailure):
                         error = {"code": "input_invalid" if isinstance(exc, (ValueError, KeyError)) else "other",
                                  "message": f"{progress()['stage']} · {type(exc).__name__}", "retryable": isinstance(exc, OSError)}
                     else:

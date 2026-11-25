@@ -11,7 +11,9 @@
 
 开发目录运行 `uv run --locked python -m film_worker launch` 打开带更新功能的面板，或运行 `uv run --locked python -m film_worker run` 启动后台执行。建模 Token 保存在 macOS 钥匙串或 Windows 凭据管理器，也可由部署环境注入 `FILM_WORKER_TOKEN`。模型服务凭证沿用本机 Codex 登录。
 
-机器接口见 `contract.openapi.yaml`。执行端通过 Bearer、注册会话及工作租约拉取工单。联调模拟服务时可在子命令前加 `--test-http`，生产接口使用 HTTPS。新工单无需制作档案或规则包，旧档案字段仅用于历史协议兼容。
+机器接口见 `contract.openapi.yaml`。接入 movie-review 时，在其「执行管理 → 设备」复制服务地址、设备标识和建模 Token。内网自签证书可在节点配置填写本机 PEM 格式的服务器证书或 CA 路径，HTTPS 同时校验证书名称。联调模拟服务时可在子命令前加 `--test-http`。新工单无需制作档案或规则包，旧档案字段仅用于历史协议兼容。
+
+movie-review 支持设备心跳上报磁盘可用与预留字节数，空间低于预留值时暂停领取。其审核包上限为 2400 帧和 256 MiB 的展开大小。超过限制时，执行端在工单记录显示服务端的具体拒收原因。[movie-review 部署与接口说明](https://github.com/zhaojin-0427/movie-review/blob/cfb2c8f3e4a5c0bd950ba3c5a1f3e5a739c6aca0/README.md)
 
 ## 包内工作流
 
