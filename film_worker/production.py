@@ -3,6 +3,8 @@ import contextlib
 import json
 import mimetypes
 import os
+import re
+import shlex
 import shutil
 import signal
 import threading
@@ -11,13 +13,18 @@ import sys
 from fractions import Fraction
 from pathlib import Path
 
-from . import bundles, media, model, quality
+from . import blender_author, bundles, draft_review, media, model, quality, shot_draft
+from .actor_guard import ACTOR_GEOMETRY
+from .engineering_checks import EngineeringValidationError
 from .production_helpers import check_rendered_frames, validate_meta, write_feedback
+from .production_palette import prompt_table
 from .protocol import digest
 from .settings import atomic_json
 from .state import slot
 
 HERE = Path(__file__).resolve().parent
+BODY_MODEL = HERE / "assets/基础模型.blend"
+SKILL = HERE / "skills/movie-shot-workflow"
 VIDEO_SUFFIXES = {"video/mp4": ".mp4", "video/quicktime": ".mov", "video/x-matroska": ".mkv",
                   "video/webm": ".webm", "video/x-msvideo": ".avi"}
 
@@ -55,7 +62,7 @@ class Production:
         self.request = request
         self.order = request["assignment"]["input_manifest"]
         self.kind = self.order["kind"]
-        self.profile = self.order["profile"]
+        self.profile = request.get("production") or self.order.get("profile") or {}
         self.env = request["environment"].copy()
         self.tools = request["tools"]
         self.sources = {key: Path(path) for key, path in request["paths"].items()}
@@ -72,10 +79,11 @@ class Production:
     def blender_command(self, *arguments):
         return [sys.executable, str(HERE / "blender_author.py"), self.tools["blender"], *arguments]
 
-    def run_tool(self, name, command, *, stdin=None, env=None, frames=None, stage=None):
+    def run_tool(self, name, command, *, stdin=None, env=None, frames=None, stage=None, engineering=False):
         logpath = self.root / (name + ".log")
         with contextlib.ExitStack() as stack:
             log = stack.enter_context(logpath.open("ab"))
+            offset = log.tell()
             prompt = stack.enter_context(stdin.open("rb")) if stdin else subprocess.DEVNULL
             child = subprocess.Popen(command, cwd=self.stage, env=env, stdin=prompt, stdout=log,
                                      stderr=subprocess.STDOUT,
@@ -88,6 +96,13 @@ class Production:
                 except subprocess.TimeoutExpired:
                     pass
         if child.returncode:
+            if engineering and child.returncode == 1:
+                with logpath.open("rb") as log:
+                    log.seek(max(offset, logpath.stat().st_size - 4096))
+                    report = re.search(r"(?m)^(?:engineering_checks\.)?EngineeringValidationError: (.+)$",
+                                       log.read().decode("utf-8", "replace"))
+                if report:
+                    raise EngineeringValidationError(report[1])
             raise RuntimeError(f"{name} 退出码 {child.returncode}，详见本机日志")
 
     def run(self):
@@ -108,7 +123,9 @@ class Production:
             if digest(temporary) != source_sha:
                 raise ValueError("源片校验失败")
             temporary.replace(source)
-        timeline = media.prepare_source(self.root, source, self.profile["final_width"])
+        width = (size(media.read_json(self.sources["version_manifest"])["final_size"])[0]
+                 if self.kind != "prepare" else self.profile.get("final_width", 3840))
+        timeline = media.prepare_source(self.root, source, width)
         self.timeline = timeline
         self.count = len(timeline["pts"])
         self.final_size = timeline["width"], timeline["height"]
@@ -123,7 +140,8 @@ class Production:
             self.previous = None
         else:
             self.timeline_file = self.sources["source_timeline"]
-            if media.read_json(self.timeline_file) != wire:
+            frozen = media.read_json(self.timeline_file)
+            if any(frozen.get(k) != v for k, v in wire.items() if k != "decoder_id"):
                 raise ValueError("本机重建的源片时间线与冻结版本不同")
             self.load_previous()
         self.timeline_sha = digest(self.timeline_file)
@@ -134,15 +152,14 @@ class Production:
     def load_previous(self):
         base = media.read_json(self.sources["version_manifest"])
         if (base["job_id"], base["version"], base["frame_count"], base["source_sha256"],
-                base["timeline_sha256"], base["profile_hash"]) != (
+                base["timeline_sha256"]) != (
                 self.order["job_id"], self.order["base_version"], self.count, self.timeline["source_sha256"],
-                digest(self.sources["source_timeline"]), self.profile["profile_hash"]):
-            raise ValueError("基版的作业、版号、原片、时间线或档案不符")
+                digest(self.sources["source_timeline"])):
+            raise ValueError("基版的作业、版号、原片或时间线不符")
         if quality.policy(self.profile) == "human_required" and base.get("production_method") != "human":
             raise ValueError("正式出片缺少已审核的人工作品来源")
         self.previous = base
-        if self.kind == "finalize":
-            self.review_size = size(base["review_size"])
+        self.review_size = size(base["review_size"])
         if size(base["final_size"]) != self.final_size:
             raise ValueError("基版交付画幅不符")
         self.prior_scene = self.root / "prior-scene"
@@ -160,7 +177,7 @@ class Production:
                 base["review_bundle_sha256"], base["shot_metadata_sha256"]):
             raise ValueError("基版工程或审片文件已变更")
         if any(review.get(k) != base.get(k) for k in (
-                "job_id", "source_sha256", "timeline_sha256", "profile_hash", "review_size", "final_size", "frames")):
+                "job_id", "source_sha256", "timeline_sha256", "review_size", "final_size", "frames")):
             raise ValueError("基版审核索引不匹配")
         if [f["number"] for f in base["frames"]] != list(range(1, self.count + 1)):
             raise ValueError("审核帧索引不连续")
@@ -178,7 +195,7 @@ class Production:
         required = dict(job_id=self.order["job_id"], base_version=base["version"],
                         base_manifest_sha256=digest(self.sources["version_manifest"]),
                         source_sha256=base["source_sha256"], timeline_sha256=base["timeline_sha256"],
-                        profile_hash=base["profile_hash"], scene_sha256=base["scene_sha256"], frame_count=self.count,
+                        scene_sha256=base["scene_sha256"], frame_count=self.count,
                         scope="all_frames" if self.kind == "finalize" else "approved_subset")
         if any(approvals.get(k) != v for k, v in required.items()) or not approvals.get("original_annotator_id"):
             raise ValueError("审批清单不是当前基版的冻结审批")
@@ -198,12 +215,6 @@ class Production:
         return result
 
     def create_review(self, source):
-        needed = ("rules_bundle", "workflow_bundle")
-        for role in needed:
-            local = self.root / role
-            if local.exists():
-                shutil.rmtree(local)
-            bundles.extract(self.sources[role], local, indexed=False)
         if self.previous:
             annotator, approved = self.approval()
             feedback = media.read_json(self.sources["feedback_manifest"])
@@ -233,15 +244,16 @@ class Production:
             if self.previous:
                 shutil.copyfile(self.scene_file, scene)
                 shutil.copyfile(self.sources["shot_metadata"], meta)
-            self.progress("waiting_for_codex")
-            with slot(Path(self.request["resources"]), "codex", self.request["model_slots"]):
-                self.author(source)
-            self.progress("validate_scene")
-            with slot(Path(self.request["resources"]), "blender", self.request["render_slots"]):
-                self.run_tool("blender-prepare", self.blender_command("-b", "--disable-autoexec", str(scene),
-                                                "--python-exit-code", "1", "-P", str(HERE / "prepare_render.py")),
-                              env=dict(os.environ, MOVIE_JOB_TIMELINE=str(self.root / "intake/timeline.json")))
-            validate_meta(meta, self.count)
+                if (self.prior_scene / ACTOR_GEOMETRY).is_file():
+                    shutil.copyfile(self.prior_scene / ACTOR_GEOMETRY, self.stage / ACTOR_GEOMETRY)
+            try:
+                self.author_and_validate(source, scene, meta)
+            except EngineeringValidationError as exc:
+                attempted = self.stage / ".engineering-repair-attempted"
+                if attempted.exists():
+                    raise
+                attempted.write_text(str(exc) + "\n", encoding="utf-8")
+                self.author_and_validate(source, scene, meta, repair=str(exc))
             atomic_json(prepared, dict(input=expected, scene=digest(scene), meta=digest(meta), environment=self.env))
         raw_meta = (self.stage / "meta.jsonl").read_text(encoding="utf-8")
         metadata = self.output / "meta.jsonl"
@@ -275,12 +287,16 @@ class Production:
             shutil.copyfile(png, review_root / png_name)
             frames.append(dict(number=i, pts=pts, review_signature=signature, pair_jpeg_path=jpg_name, white_png_path=png_name))
         common = dict(schema_version=1, job_id=self.order["job_id"], source_sha256=self.timeline["source_sha256"],
-                      timeline_sha256=self.timeline_sha, profile_hash=self.profile["profile_hash"], scene_sha256=scene_sha,
+                      timeline_sha256=self.timeline_sha, scene_sha256=scene_sha,
                       review_size=dimensions(self.review_size), final_size=dimensions(self.final_size), frames=frames)
+        if "profile_hash" in self.profile:
+            common["profile_hash"] = self.profile["profile_hash"]
         review_bundle = self.output / "review.zip"
         bundles.build(review_root, dict(common, target_version=self.order["target_version"]), review_bundle)
         report = self.output / "production.json"
-        media.write_json(report, dict(kind=self.kind, frame_count=self.count, environment=self.env))
+        records = self.stage / "制作记录.md"
+        details = records.read_text(encoding="utf-8")[:30000] if records.is_file() else ""
+        media.write_json(report, dict(kind=self.kind, frame_count=self.count, environment=self.env, notes=details))
         manifest = self.output / "version.json"
         media.write_json(manifest, dict(common, version=self.order["target_version"], frame_count=self.count,
                                         production_method="codex_trial", scene_bundle_sha256=digest(scene_bundle), review_bundle_sha256=digest(review_bundle),
@@ -297,38 +313,123 @@ class Production:
         portable = self.root / "packed-scene"
         portable.mkdir(exist_ok=True)
         shutil.copyfile(scene, portable / "scene.blend")
+        if (self.stage / ACTOR_GEOMETRY).is_file():
+            shutil.copyfile(self.stage / ACTOR_GEOMETRY, portable / ACTOR_GEOMETRY)
         return portable
 
-    def author(self, source):
-        self.progress("codex_author")
-        p = self.profile
-        blender = subprocess.list2cmdline(self.blender_command())
-        if os.name != "nt":
-            import shlex
-            blender = shlex.join(self.blender_command())
-        prompt = self.root / "prompt.txt"
-        prompt.write_text(f"""内部试制电影白模。先查看原片和代表帧，制作可编辑的 Blender 场景，后续由人逐帧审片。
-原片 {source}。编号源帧 {self.frames}。规则目录 {self.root/'rules_bundle'}。参考工作流 {self.root/'workflow_bundle'}。
-输出到当前工作目录：scene.blend 和 meta.jsonl。镜头说明每行一个对象，字段 start_frame、end_frame、description，
-连续覆盖全部 {self.count} 帧。Blender 帧号为 1–{self.count}，输出比例对应 {self.final_size}。
-若当前目录已有 scene.blend、meta.jsonl、feedback.json，按圈选图及逐帧原意见返修。检查意见前后相邻画面以及全片同类问题。
-优先保证构图、场景和动作的时空对应。不得改动输入文件，不得交付用原始视频做贴图的平面。
-首制和返修只需处理画面与镜头说明。执行端会在出片阶段按原始时码回配并校验同期声。
-只有本批验收规则明确要求工程内携带音轨时，才在 Blender 内添加音轨。成片混音由执行端完成。
-只用无界面的 Blender，启动前缀 {blender}，传 -b 和 --python-exit-code 1。最终工程内打包使用的外部资源。
-{quality.REVIEW_CHECKLIST}""", encoding="utf-8")
-        command = model.options(self.tools["codex"], p, self.stage, sandbox="workspace-write")
-        command += ["-o", str(self.root / "codex-receipt.txt"), "-"]
-        self.run_tool("codex", command, stdin=prompt)
-        with (self.root / "codex.log").open(encoding="utf-8", errors="replace") as log:
+    def author_and_validate(self, source, scene, meta, *, repair=None):
+        self.progress("repair_engineering" if repair else "waiting_for_codex")
+        resources = Path(self.request["resources"])
+        with slot(resources, "codex", self.request["model_slots"]):
+            if repair is None:
+                self.author(source)
+            else:
+                self.author(source, repair=repair)
+        if not scene.is_file():
+            raise EngineeringValidationError("缺少可编辑的 Blender 工程 scene.blend")
+        try:
+            validate_meta(meta, self.count)
+        except ValueError as exc:
+            raise EngineeringValidationError(str(exc)) from exc
+        self.progress("validate_scene")
+        with slot(resources, "blender", self.request["render_slots"]):
+            self.run_tool("blender-prepare", self.blender_command("-b", "--disable-autoexec", str(scene),
+                          "--python-exit-code", "1", "-P", str(HERE / "prepare_render.py")),
+                          env=dict(os.environ, MOVIE_JOB_TIMELINE=str(self.root / "intake/timeline.json"),
+                                   MOVIE_BUILTIN_RULES="1"), engineering=True)
+
+    def draft_commands(self, source):
+        compile_cmd = shot_draft.compile_command(self.blender_command(), self.stage)
+        review_cmd = [sys.executable, str(HERE / "draft_review.py"), str(self.stage), str(source),
+                      self.tools["blender"], str(self.request["cpu_threads"]),
+                      "--ffmpeg", self.tools["ffmpeg"], "--ffprobe", self.tools["ffprobe"]]
+        return compile_cmd, review_cmd
+
+    def author_prompt(self, source, repair=None):
+        quote = subprocess.list2cmdline if os.name == "nt" else shlex.join
+        compile_cmd, review_cmd = self.draft_commands(source)
+        skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+        sop = (SKILL / "references/制作SOP.md").read_text(encoding="utf-8")
+        phase = f"""这是 Codex 内部试制首制。先核对完整原片、编号帧和 镜头参考，使用连续帧修正候选切点。
+完成 shot-plan.json 后用下列命令编译出完整 scene.blend 与 meta.jsonl：
+{quote(compile_cmd)}
+可追加 --preview 与帧号快速试渲。随后按原时间线编码全部帧的首版自检对比：
+{quote(review_cmd)}
+查看整条自检片。无法播放时从编码后的视频解出连续画面，逐镜复查，发现偏差就修正、重编、重新编码再检查。
+镜头表规范如下。
+{(SKILL / 'references/镜头表.md').read_text(encoding='utf-8')}
+""" if self.kind == "prepare" else """这是 Codex 内部试制返修。当前目录已有基版场景、镜头信息、返修单和圈选预览。
+先读 feedback-summary.json，再按需要检查 feedback.json 原文、圈选图及连续源帧。按帧号核对受影响的动作范围和相邻帧，修改 scene.blend 及需要更新的 meta.jsonl。
+圈选坐标相对于整张上下对比图，上方原片、下方白模。补建网格使用包内 production_palette.apply_palette 并保留原来的人体几何及其配色属性。
+"""
+        technical = (f"\n工程核验失败，工作台要求做一次技术修复。实际错误：{repair}\n"
+                     "仅修复此问题及直接受影响的文件。首制修改后重新编译、编码和检查。") if repair else ""
+        return f"""原片 {source}。编号源帧 {self.frames}。本轮只写入 {self.stage}。
+使用包内人体白模 {BODY_MODEL}，以及随本提示附带的制作规则、镜头表与固定配色。制作帧从 1 到 {self.count}，
+沿用原片显示时间，工程画幅 {self.final_size}。全片渲染、签名比对、送审和成片由执行端处理。
+Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b --disable-autoexec --python-exit-code 1。
+检查投影与预览也沿用此命令。Windows PowerShell 中为带引号的可执行文件添加调用符 &。
+所有制作和试渲统一用 Cycles。禁止在补建脚本或工程中切换到 Eevee、Workbench。
+如需从自检 MP4 读取编号帧，FFmpeg 路径为 {quote([self.tools["ffmpeg"]])}。
+提交本轮 制作记录.md，写明切点、可见动作、核对过的帧段和需要人工判断的地方。
+禁止用源帧贴图、加入外部素材、重塑甲方人体或访问历史工单和用户目录。
+
+{phase}
+{technical}
+{skill}
+{sop}
+
+## 工作台内置配色
+{prompt_table()}
+"""
+
+    def run_model(self, text, name):
+        prompt = self.root / (name + "-prompt.txt")
+        prompt.write_text(text, encoding="utf-8")
+        overrides = dict(self.profile)
+        if self.kind == "prepare" and not overrides.get("reasoning_effort"):
+            overrides["reasoning_effort"] = "medium"
+        with blender_author.background_environment(self.tools["blender"]) as env:
+            env.pop("FILM_WORKER_TOKEN", None)
+            command = model.options(self.tools["codex"], overrides, self.stage, sandbox="workspace-write",
+                                    blender_config=env.get("BLENDER_USER_CONFIG"))
+            command += ["-o", str(self.root / (name + "-receipt.txt")), "-"]
+            self.run_tool(name, command, stdin=prompt, env=env)
+        with (self.root / (name + ".log")).open(encoding="utf-8", errors="replace") as log:
             actual = model.evidence(log.read(32768))
-        for field, value in actual.items():
-            if value and value != p[field]:
-                raise ValueError(f"实际模型参数 {field} 与冻结档案不匹配")
-        if all(actual.values()):
-            self.env.update(actual, model_evidence="observed")
-        else:
-            self.env.update(actual, model_evidence="unknown")
+        self.env.update(actual, model_evidence="observed" if all(actual.values()) else "unknown")
+
+    def author(self, source, *, repair=None):
+        self.progress("repair_engineering" if repair else "codex_author")
+        if self.kind == "prepare" and not (self.stage / "draft-context.json").is_file():
+            if not BODY_MODEL.is_file():
+                raise RuntimeError("发布包缺少基础模型.blend，请恢复完整的执行端")
+            shot_draft.prepare(self.stage, source, self.root / "intake", self.timeline, BODY_MODEL)
+        prompt = self.author_prompt(source, repair)
+        self.run_model(prompt, "codex-repair" if repair else "codex")
+        if self.kind == "prepare":
+            self.complete_draft(source, prompt)
+
+    def complete_draft(self, source, prompt):
+        if not (self.stage / "shot-plan.json").is_file():
+            raise EngineeringValidationError("首版缺少 shot-plan.json")
+        compile_cmd, review_cmd = self.draft_commands(source)
+        resources = Path(self.request["resources"])
+        record = self.stage / "制作记录.md"
+        if not shot_draft.current(self.stage):
+            with slot(resources, "blender", self.request["render_slots"]):
+                self.run_tool("compile-draft", compile_cmd, engineering=True)
+        current = draft_review.current(self.stage)
+        if current and record.is_file() and record.read_text(encoding="utf-8").strip():
+            return
+        self.progress("draft_review")
+        if not current:
+            with slot(resources, "blender", self.request["render_slots"]):
+                self.run_tool("draft-review", review_cmd, engineering=True)
+        self.run_model(prompt + "\n复查当前首版自检对比片，修正后重新编码并更新制作记录。", "codex-self-review")
+        if not (shot_draft.current(self.stage) and draft_review.current(self.stage)
+                and record.is_file() and record.read_text(encoding="utf-8").strip()):
+            raise EngineeringValidationError("首版缺少本工程对应的自检对比片或制作记录")
 
     def render(self, scene, target, purpose):
         self.progress("waiting_for_blender")

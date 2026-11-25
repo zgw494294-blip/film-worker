@@ -5,6 +5,7 @@ from pathlib import Path
 from PIL import Image
 
 from . import media
+from .production import BODY_MODEL, SKILL
 from .state import State
 
 
@@ -14,6 +15,9 @@ def check(root):
     if any(not (Path(__file__).parent / "web" / asset).is_file()
            for asset in ("index.html", "panel.css", "panel.js")):
         raise ValueError("安装包的控制界面文件不完整")
+    resources = (BODY_MODEL, SKILL / "SKILL.md", SKILL / "references/制作SOP.md", SKILL / "references/镜头表.md")
+    if any(not file.is_file() or not file.stat().st_size for file in resources):
+        raise ValueError("安装包缺少制作规则、镜头表或人体白模")
     if "libx264" not in media.av.codecs_available:
         raise ValueError("PyAV 环境无 H.264 编码器")
     import os

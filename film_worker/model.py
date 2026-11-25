@@ -5,18 +5,20 @@ import re
 import subprocess
 import tempfile
 
-from .settings import object_hash
-
-
-MODEL_FIELDS = ("codex_provider", "codex_model", "reasoning_effort")
-
-
-def options(binary, profile, directory, *, sandbox):
-    return [binary, "exec", "--skip-git-repo-check", "--sandbox", sandbox,
-            "-c", 'approval_policy="never"', "-m", profile["codex_model"],
-            "-c", "model_reasoning_effort="+json.dumps(profile["reasoning_effort"]),
-            "-c", "model_provider="+json.dumps(profile["codex_provider"]),
-            "--color", "never", "-C", str(directory)]
+def options(binary, config, directory, *, sandbox, blender_config=None):
+    command = [binary, "exec", "--skip-git-repo-check", "--sandbox", sandbox,
+               "-c", 'approval_policy="never"', "-c", "project_doc_max_bytes=0",
+               "-c", 'web_search="disabled"', "-c", "sandbox_workspace_write.network_access=false",
+               "--disable", "hooks", "--disable", "memories", "--disable", "plugins",
+               "--color", "never", "-C", str(directory)]
+    if config.get("codex_model"):
+        command += ["-m", config["codex_model"]]
+    for field, key in (("reasoning_effort", "model_reasoning_effort"), ("codex_provider", "model_provider")):
+        if config.get(field):
+            command += ["-c", key+"="+json.dumps(config[field])]
+    if blender_config:
+        command += ["-c", "shell_environment_policy.set.BLENDER_USER_CONFIG="+json.dumps(blender_config)]
+    return command
 
 
 def evidence(header):
@@ -40,18 +42,6 @@ def test(binary, profile):
         observed = evidence(output.stderr[:32768])
         if "FILM_WORKER_OK" not in output.stdout:
             raise ValueError("Codex 未返回预期验证结果")
-        if any(value is not None and value != profile[field] for field, value in observed.items()):
-            raise ValueError("实际模型或推理配置与制作档案不符")
+        if any(value and profile.get(field) and value != profile[field] for field, value in observed.items()):
+            raise ValueError("实际模型或推理配置与本机设置不符")
         return {"reply":"FILM_WORKER_OK", "observed":observed}
-
-
-def draft(original, model):
-    profile = {**original}
-    for field in MODEL_FIELDS:
-        value = model[field]
-        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", value):
-            raise ValueError(f"请填写有效的 {field}")
-        profile[field] = value
-    profile.pop("profile_hash", None)
-    profile["profile_hash"] = object_hash(profile)
-    return profile

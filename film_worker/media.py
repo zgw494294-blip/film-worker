@@ -152,11 +152,14 @@ def compare_version(stage, source_dir, timeline, progress, previous=None, size=N
     return signatures
 
 
-def encode_images(path, timeline, size, get_image):
+def encode_images(path, timeline, size, get_image, *, preview=False):
     base = Fraction(timeline["time_base"])
     pts = timeline["pts"]
     durations = dict(zip(pts, [b-a for a, b in zip(pts, pts[1:] + [timeline["end"]])]))
-    with av.open(str(path), "w", options={"video_track_timescale": str(base.denominator)}) as output:
+    options = {"video_track_timescale": str(base.denominator)}
+    if preview:
+        options["movflags"] = "+faststart"
+    with av.open(str(path), "w", options=options) as output:
         stream = output.add_stream("libx264", rate=Fraction(timeline["fps"]).limit_denominator(65535))
         stream.width, stream.height = size
         stream.pix_fmt = "yuv420p"
@@ -165,9 +168,13 @@ def encode_images(path, timeline, size, get_image):
         stream.codec_context.thread_count = 3
         stream.codec_context.colorspace = stream.codec_context.color_primaries = stream.codec_context.color_trc = 1
         stream.codec_context.color_range = 1
-        stream.bit_rate = 30_000_000
-        stream.options = {"preset": "veryfast", "tune": "zerolatency",
-                          "x264-params": "nal-hrd=cbr:vbv-maxrate=30000:vbv-bufsize=30000:vbv-init=1:filler=1"}
+        settings = {"preset": "veryfast", "tune": "zerolatency"}
+        if preview:
+            settings["crf"] = "18"
+        else:
+            stream.bit_rate = 30_000_000
+            settings["x264-params"] = "nal-hrd=cbr:vbv-maxrate=30000:vbv-bufsize=30000:vbv-init=1:filler=1"
+        stream.options = settings
         convert = VideoReformatter()
 
         def mux(packets):
@@ -201,14 +208,14 @@ def add_audio(silent, destination, timeline, source):
     silent.unlink()
 
 
-def validate_encoded(path, timeline, size):
+def validate_encoded(path, timeline, size, *, preview=False):
     metadata, video, pts, base, duration, _ = intake.measure(path)
     source_base = Fraction(timeline["time_base"])
     if ((video["width"], video["height"]) != size or video["codec_name"] != "h264" or
         len(pts) != len(timeline["pts"]) or duration != Fraction(timeline["duration"]) or
         any(t * base != ref * source_base for t, ref in zip(pts, timeline["pts"]))):
         raise ValueError(f"编码后帧数、时间戳、时长或画幅核验失败：{path.name}")
-    if int(video.get("bit_rate", 0)) < 18_000_000:
+    if not preview and int(video.get("bit_rate", 0)) < 18_000_000:
         raise ValueError(f"编码后视频码率低于 18 Mbps：{path.name}")
     tracks = [s for s in metadata["streams"] if s["codec_type"] == "audio"]
     if timeline["audio_index"] is None:

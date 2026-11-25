@@ -16,10 +16,9 @@ from unittest.mock import patch
 from PIL import Image
 
 from film_worker import intake, media
-from film_worker.model import MODEL_FIELDS
 from film_worker.processes import ProcessTree
 from film_worker.scheduler import Scheduler
-from film_worker.settings import DEFAULTS, ROOT, inspect_tools, object_hash, resolve_tools
+from film_worker.settings import DEFAULTS, MODEL_FIELDS, ROOT, resolve_tools
 from test_server_flow import mock_service, node_config, sha
 
 
@@ -29,13 +28,6 @@ REFERENCES = ("version_manifest","scene_bundle","shot_metadata","review_bundle",
 def tool_overrides():
     return {name: os.environ[f"FILM_TEST_{name.upper()}"] for name in ("blender","codex","ffmpeg","ffprobe")
             if os.environ.get(f"FILM_TEST_{name.upper()}")}
-
-
-def archive(label):
-    data = io.BytesIO()
-    with zipfile.ZipFile(data,"w") as z:
-        z.writestr("fixture.txt",label)
-    return data.getvalue()
 
 
 def json_blob(data):
@@ -87,10 +79,10 @@ class WholeMediaSimulation(unittest.TestCase):
     def test_variable_source_timing_survives_revision_by_another_node_and_4k(self):
         self.roundtrip(variable=True, export_quality="4k")
 
-    def test_finalize_can_select_1080p_after_approval_under_a_4k_profile(self):
+    def test_finalize_can_select_1080p_after_approval_for_a_4k_native_scene(self):
         self.roundtrip(variable=False, export_quality="1080p")
 
-    @unittest.skipUnless(os.getenv("FILM_WORKER_TEST_REAL_CODEX")=="1","requires a locally authenticated Codex profile")
+    @unittest.skipUnless(os.getenv("FILM_WORKER_TEST_REAL_CODEX")=="1","requires a locally authenticated Codex")
     def test_real_codex_authors_and_revises_work_received_from_the_mock_manager(self):
         model = {field: os.environ["FILM_TEST_"+field.upper()] for field in MODEL_FIELDS}
         self.roundtrip(variable=False,model=model)
@@ -135,29 +127,17 @@ class WholeMediaSimulation(unittest.TestCase):
             config["cpu_threads"] = 2
             config.update(tool_overrides())
             tools = resolve_tools(config)
-            versions = inspect_tools(tools)
             clip = root/"input.mp4"
             if model:
                 codex_source_clip(tools["ffmpeg"],clip)
-                rule_text = ("本次为流程验收用合成片，只制作灰底上一个白色正方形。使用正交相机、固定白色材质和低采样的 "
-                             "Cycles CPU。首制对齐原片的白色方形。出现返修意见时，以意见里的目标位置为准。"
-                             "音轨由执行端在出片时回配，本样片的 Blender 工程只包含画面。")
-                workflow_text = ("先查看编号源帧。用命令行 Blender 创建工程和可编辑的物体，必要时用自发光材质。"
-                                 "时间线是 1–3 帧，固定镜头。输出 scene.blend 和覆盖三帧的 meta.jsonl。")
-                note = "将白色方块在画面上整体向右移动约 80 个原片像素，三个画面保持相同的缩放和移动后的构图。"
+                note = "将白色方块在画面上整体向右移动约 80 个原片像素，三个画面保持相同的缩放。"
             else:
                 source_clip(tools["ffmpeg"],clip,variable=variable)
-                rule_text, workflow_text, note = "test rules", "test workflow", "主体右移"
+                note = "主体右移"
             source = service.store("source_video",clip.read_bytes(),"video/mp4")
-            rules = service.store("rules_bundle",archive(rule_text),"application/zip")
-            workflow = service.store("workflow_bundle",archive(workflow_text),"application/zip")
-            defaults = {"source_video":source,"rules_bundle":rules,"workflow_bundle":workflow}
-            profile = service.profile
+            defaults = {"source_video":source}
             if model:
-                profile.update(model)
-            profile["compatibility"].update(versions,rules_sha256=rules["sha256"],workflow_sha256=workflow["sha256"])
-            profile.pop("profile_hash")
-            profile["profile_hash"] = object_hash(profile)
+                config.update(model)
 
             timeout = 360 if model else 70
             scene_authoring = nullcontext() if model else patch("film_worker.scheduler.ProcessTree",start_fixture)
@@ -257,7 +237,7 @@ class WholeMediaSimulation(unittest.TestCase):
     def approval(self, service, version, status, *, all_frames, carried=()):
         subset = version["frames"] if all_frames else [version["frames"][0]]
         entry = dict(status,scope="all_frames" if all_frames else "approved_subset",
-                     **{k:version[k] for k in ("source_sha256","profile_hash","scene_sha256","frame_count")})
+                     **{k:version[k] for k in ("source_sha256","scene_sha256","frame_count")})
         entry["frames"] = [dict(number=f["number"],review_signature=f["review_signature"],
                                 approved_version=1 if f["number"] in carried else version["version"]) for f in subset]
         return service.store("approval_manifest",json_blob(entry),"application/json")

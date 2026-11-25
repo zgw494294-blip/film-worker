@@ -7,13 +7,18 @@
 1. 将与机器架构匹配的 ZIP 解压到本机。Apple Silicon 选择 `macos-arm64`，Windows 选择 `windows-x86_64`。离线包包含 CPython、uv、锁定的 Python 媒体库、FFmpeg 9.0.2、FFprobe 和目标系统组件。首次打开自动校验并安装到本机数据目录，再次打开沿用已有依赖。单独下载的开发源码可用本机 uv 安装。
 2. macOS 打开 `启动执行端.command`，Windows 打开 `启动执行端.cmd`。如需独立数据盘，给启动程序传入 `--data <目录>`。配置页只在本机回环地址监听。
 3. 准备 Blender 和已登录的 Codex CLI。离线安装会同时配置媒体工具，已有配置可在“工具路径”覆盖。macOS 可自动发现 Applications 里的 Blender 与 ChatGPT 所带 CLI。Windows 可复用当前账号安装的 Codex 桌面应用所带 CLI，也会查找常见的 npm Codex 目录。可在面板指定原生 `codex.exe` 和 `blender.exe` 的绝对路径。[Codex 官方原生包布局](https://github.com/openai/codex/blob/main/codex-cli/scripts/build_npm_package.py)
-4. 保存公网服务 URL、管理员发放的节点标识、建模 Token 和服务端下发的制作档案数组。点击“检测本机工具”查看本机工具与执行端版本，也可以在“模型与制作档案”测试已保存的 Codex 调用。更换服务商、模型或推理强度可生成新档案，由管理员使用相同档案派发。然后启动节点。调整配置前，暂停领单并等待在途工单交回。关闭浏览器可以在启动进程存续期间继续制作。
+4. 保存公网服务 URL 和管理员发放的建模 Token。节点标识用于兼容需要它的服务。模型、服务商或推理强度可在本机面板设置，留空使用本机 Codex 的配置。点击“启动节点”注册并领取任务。调整配置前先暂停领单，待在途工单交回后停止节点。
 
-开发目录中可用 `uv run --locked python -m film_worker launch` 打开带更新功能的面板，也可用 `uv run --locked python -m film_worker run` 直接启动执行服务。机器 Token 保存在 macOS 钥匙串或 Windows 凭据管理器，部署脚本也可通过 `FILM_WORKER_TOKEN` 注入。Codex 的登录和模型服务凭证保存在本机 Codex 配置中。
+开发目录运行 `uv run --locked python -m film_worker launch` 打开带更新功能的面板，或运行 `uv run --locked python -m film_worker run` 启动后台执行。建模 Token 保存在 macOS 钥匙串或 Windows 凭据管理器，也可由部署环境注入 `FILM_WORKER_TOKEN`。模型服务凭证沿用本机 Codex 登录。
 
-机器接口见 `contract.openapi.yaml`。Mac 与 Windows 使用同一套锁定源码构建 FFmpeg；领同一制作档案还需使用相符的 Blender、Codex CLI、解码器及执行端版本。不匹配时面板显示要求值和本机值。正式环境使用 HTTPS。与本机模拟服务器联调时，可以在子命令前加 `--test-http`。模型、推理强度、工作流和程序提交由制作档案锁定，节点注册仅公布本机可兑现的档案。
+机器接口见 `contract.openapi.yaml`。执行端通过 Bearer、注册会话及工作租约拉取工单。联调模拟服务时可在子命令前加 `--test-http`，生产接口使用 HTTPS。新工单无需制作档案或规则包，旧档案字段仅用于历史协议兼容。
 
-管理端可在出片工单的 `input_manifest.export_quality` 中选 `1080p` 或 `4k`。选项不影响已经通过的审核帧。1080p 在同尺寸时直接编码签名核验通过的白模帧。4K 使用宽 3840 的制作档案。未指定时沿用已通过版本的档案画幅。
+## 包内工作流
+
+- 执行端内置当前工作台的制作 Skill、SOP、镜头表、固定配色、L3 人体白模及编译和渲染脚本。首制核对原片与候选切点，编译可编辑工程，并编码整片自检视频。
+- 返修从服务端取得基版和返修单，提供带编号的圈选图。工程检查发现可修项时自动交给 Codex 一次，复检通过后以 1080P 限制全量渲染。上传本轮工程、逐帧图、无损白模帧、镜头信息和报告。
+- 出片核验人工审批和工件摘要。`1080p` 使用已通过的无损帧编码，`4k` 从批准的工程按原生画幅渲染。交付沿用原片显示时码和同期声。
+- macOS 包内含 Blender 5.2.3 后台配置。Blender 编译、预览、检查和渲染统一通过启动器。Codex 进程也继承这份临时配置，适用于实际定位到的 Metal 启动探测崩溃。
 
 标有 PQ 或 HLG 的原片通过随包 FFmpeg 的色调映射生成 BT.709 抽帧和缩略图。归档包中的原始视频保持上传文件的字节和色彩信息。[FFmpeg 色调映射选项](https://ffmpeg.org/ffmpeg-filters.html#scale)
 
@@ -25,11 +30,11 @@
 
 ## Git 更新
 
-从 GitHub 发布页安装的新节点默认开启 `stable` 自动检查，安装包内置可信发布公钥。私有仓库的读取权限由节点所在账号的 Git 凭据提供。现有节点可在面板的“Git 更新”开启检查和查看状态。
+默认从 `https://github.com/zgw494294-blip/film-worker.git` 检查签名的 `stable` 标签。安装包内置可信发布公钥。已有节点可在面板的“Git 更新”检查、手动更新或回退。
 
 管理者先执行 `python scripts/release_manifest.py <版本> <递增序号>`，将生成的 `release.json` 随发布代码提交，再用受信任的 SSH 发布私钥签署 annotated tag。升级节点只读取所配置仓库的该标签。签名公钥以 Git `allowed_signers` 格式提供给节点，例如 `publisher ssh-ed25519 AAAA…`。Windows 节点需要 Git 和 OpenSSH 的 `ssh-keygen`。在面板填仓库、标签和公钥文件，开启自动检查，或按“检查并更新”。[Git 签名校验](https://git-scm.com/docs/git-verify-tag) · [可信发布者文件格式](https://git-scm.com/docs/git-config#Documentation/git-config.txt-gpgsshallowedSignersFile)
 
-新版以锁文件准备独立环境，并完成 SQLite、编解码和像素签名自检。切换前暂停领单并等待在途工单收束。新版启动验证失败时自动用上一个版本恢复，也可从面板手动回退。之前已消化的发布序号保持记录，旧签名包不会触发自动降级。管理员须同步准备含新版提交号的制作档案，才能为新版派发相应作业。
+新版以锁文件准备独立环境，并完成 SQLite、编解码和像素签名自检。切换前暂停领单并等待在途工单收束。新版启动验证失败时自动用上一个版本恢复，也可从面板手动回退。之前已消化的发布序号保持记录，旧签名包不会触发自动降级。新版继续凭建模 Token 领取服务端工单。
 
 自动检查可指定本机时区内的起止时间。例如 23:00 至次日 05:00，检查及准备更新从这一时间段内开始，安装在当前工单提交后进行。开始和结束时间均留空时，按设置的频率全天检查。
 
@@ -56,4 +61,4 @@
 
 《验收标准.pdf》和《错误类型分类汇总.docx》是本项目的制作规则来源。执行端把十类问题写入首制、返修的对照检查。位置、镜头、动作、遮挡、颜色和时序质量由人工逐帧验收。技术检查读取原片、白模和对比三套实际文件，在 `meta/video-technical.jsonl` 记录统一 sample ID、对应文件路径、编解码、画幅、时长、帧率、音轨和黑帧结果。模型制作说明保存在单独的镜头 JSONL。出片核验包含片尾最后一秒。
 
-已确认的内部试制使用 `codex_trial`。若服务端将正式档案设置为 `human_required`，节点禁止自动首制和返修。此档案仅接收出片任务，要求已通过版本带有人工作品来源及冻结的人工通过清单。正式批次的片长和画幅按附件技术表检查。人工作品入库与来源审核由服务端负责。
+已确认的内部试制使用 `codex_trial`。若服务端将工单制作方式设置为 `human_required`，节点只接收该工单的出片阶段，要求已通过版本带有人工作品来源及冻结的人工通过清单。正式批次的片长和画幅按附件技术表检查。人工作品入库与来源审核由服务端负责。

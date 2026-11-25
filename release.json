@@ -1,6 +1,6 @@
 {
-  "version": "0.1.1",
-  "sequence": 2,
+  "version": "0.1.2",
+  "sequence": 3,
   "platforms": [
     "macos-arm64",
     "windows-x86_64"

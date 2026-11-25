@@ -82,14 +82,16 @@ class ProductionMock(ThreadingHTTPServer):
             return [r for r in receipt["artifacts"] if r["role"] in roles]
 
     def schedule(self, kind, version, *, slug=None, job="job1", attempt=1, drop_reply=False,
-                 artifacts=None, export_quality=None):
+                 artifacts=None, export_quality=None, legacy_profile=False):
         work = f"work-{slug or kind}"
         artifacts = artifacts or [dict(artifact_id="asset", role=role, sha256=sha(self.input), size_bytes=len(self.input),
                           media_type="application/octet-stream")
-                     for role in ("source_video", "rules_bundle", "workflow_bundle")]
+                     for role in ("source_video",)]
         order = dict(schema_version=1, job_id=job, work_id=work, kind=kind,
                      base_version=None if kind=="prepare" else (version-1 if kind=="revise" else version),
-                     target_version=version, profile=self.profile, artifacts=artifacts)
+                     target_version=version, artifacts=artifacts)
+        if legacy_profile:
+            order["profile"] = self.profile
         if export_quality is not None:
             order["export_quality"] = export_quality
         assignment = dict(job_id=job, work_id=work, kind=kind, input_manifest=order,
@@ -138,7 +140,7 @@ class Fixture(BaseHTTPRequestHandler):
         with server.mutex:
             if path=="workers/register":
                 server.registered.append(payload)
-                worker = server.workers.setdefault(payload["node_key"],f"node-{len(server.workers)+1}")
+                worker = server.workers.setdefault(payload.get("node_key", "bearer-node"),f"node-{len(server.workers)+1}")
                 return self.answer(200, dict(worker_id=worker, server_time=now(), heartbeat_seconds=30,
                                             claim_wait_max_seconds=25, lease_seconds=90, lease_heartbeat_seconds=server.heartbeat_interval,
                                             part_size_bytes=8388608))
@@ -307,7 +309,7 @@ def node_running(config, root, produce):
 
 def node_config(service, slots=1):
     return {**DEFAULTS, "node_key":"fixture", "server":f"http://127.0.0.1:{service.server_port}",
-            "profiles":[service.profile], "disk_reserve_gib":1, "slots":slots}
+            "disk_reserve_gib":1, "slots":slots}
 
 
 production = Scheduler.produce
@@ -328,10 +330,13 @@ class WorkerFlow(unittest.TestCase):
     def test_registration_to_review_and_final_delivery_with_lost_receipt(self):
         with tempfile.TemporaryDirectory(prefix="worker-flow-") as folder, mock_service() as service:
             service.schedule("prepare",1,drop_reply=True)
-            with node_running(node_config(service), Path(folder), fixture_outputs) as node:
+            with node_running({**node_config(service), "node_key": ""}, Path(folder), fixture_outputs) as node:
                 self.wait_for(lambda: service.replayed.get("work-prepare"), node)
                 self.wait_for(lambda: node.state.rows()[0]["status"]=="succeeded", node)
                 self.assertEqual(len(service.registered),1)
+                self.assertNotIn("node_key", service.registered[0])
+                self.assertNotIn("profile_hashes", service.registered[0]["capabilities"])
+                self.assertNotIn("profile_hash", service.attempts["work-prepare"]["body"])
                 self.assertEqual(service.completed,["work-prepare"])
                 service.schedule("revise",2)
                 self.wait_for(lambda:"work-revise" in service.completed,node)

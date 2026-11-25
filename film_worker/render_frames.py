@@ -5,9 +5,14 @@ from pathlib import Path
 
 import bpy
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from engineering_checks import require_cycles
 
-def render(output, backend, width, height, threads):
+
+def render(output, backend, width, height, threads, *, draft=False):
     scene = bpy.context.scene
+    if draft:
+        require_cycles(scene.render.engine)
     scene.render.resolution_x = width
     scene.render.resolution_y = height
     scene.render.resolution_percentage = 100
@@ -16,6 +21,8 @@ def render(output, backend, width, height, threads):
     scene.render.threads_mode = "FIXED"
     scene.render.threads = threads
     if scene.render.engine == "CYCLES":
+        if draft:
+            scene.cycles.samples = 2
         if backend != "cpu":
             preferences = bpy.context.preferences.addons["cycles"].preferences
             device_type = backend.upper()
@@ -52,5 +59,6 @@ parser.add_argument("backend", choices=("metal", "cpu", "cuda", "optix", "hip", 
 parser.add_argument("width", type=int)
 parser.add_argument("height", type=int)
 parser.add_argument("threads", type=int)
+parser.add_argument("--draft", action="store_true")
 args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
-render(args.output.resolve(), args.backend, args.width, args.height, args.threads)
+render(args.output.resolve(), args.backend, args.width, args.height, args.threads, draft=args.draft)

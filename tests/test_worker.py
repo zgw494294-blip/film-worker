@@ -209,12 +209,10 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(len(state.rows(True)), 1)
             self.assertEqual(json.loads(state.rows(True)[0]["pending"]), {"outputs": ["fixture"]})
 
-    def test_incompatible_media_tool_build_names_the_exact_difference(self):
-        profile = {"compatibility":{"ffmpeg":"9.0.2"}, "codex_model":"fixture",
-                   "codex_provider":"fixture", "reasoning_effort":"medium"}
-        profile["profile_hash"] = object_hash(profile)
-        with self.assertRaisesRegex(ValueError,"ffmpeg 要求 9.0.2，本机 8.1"):
-            registration({**DEFAULTS,"profiles":[profile]}, "fixture", {"ffmpeg":"8.1"})
+    def test_registration_reports_tools_without_requiring_a_production_profile(self):
+        capabilities = registration(DEFAULTS, "fixture", {"ffmpeg": "8.1"})["capabilities"]
+        self.assertEqual(capabilities["environment"]["compatibility"]["ffmpeg"], "8.1")
+        self.assertNotIn("profile_hashes", capabilities)
 
     def test_formal_batch_prohibits_automatic_authoring(self):
         profile = {"production_policy": "human_required"}

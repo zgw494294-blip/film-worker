@@ -10,12 +10,62 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from film_worker import media, production
+from film_worker import draft_review, media, production
 from film_worker.production import Production
 from film_worker.settings import DEFAULTS, resolve_tools
 
 
 class ProductionTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("FILM_WORKER_TEST_MEDIA") == "1", "requires Blender and FFmpeg")
+    def test_bundled_first_draft_repair_and_full_timeline_self_review(self):
+        tools = resolve_tools(DEFAULTS)
+        with tempfile.TemporaryDirectory(prefix="film-bundled-draft-") as raw:
+            root = Path(raw)
+            clip = root / "input.mp4"
+            subprocess.run([tools["ffmpeg"], "-v", "error", "-f", "lavfi", "-i",
+                            "color=s=160x90:r=24", "-frames:v", "3", "-c:v", "libx264", str(clip)], check=True)
+            work = root / "work"
+            work.mkdir()
+            order = dict(kind="prepare", job_id="fixture", target_version=1, artifacts=[
+                dict(role="source_video", media_type="video/mp4")])
+            request = dict(assignment=dict(input_manifest=order, input_manifest_sha256="0"*64), tools=tools,
+                           paths={"source_video": str(clip)}, environment=dict(render_backend="cpu"),
+                           production=dict(final_width=320, compatibility={"decoder_id":"test"},
+                                           review_landscape_limit={"width":1920,"height":1080}),
+                           resources=str(root / "slots"), cpu_threads=2, model_slots=1, render_slots=1)
+            worker = Production(work, request)
+            stages = []
+
+            def fixture(prompt, name):
+                stages.append(name)
+                self.assertIn("制作 SOP", prompt)
+                self.assertIn(str(production.BODY_MODEL), prompt)
+                self.assertNotIn("workflow_bundle", prompt)
+                if name == "codex-self-review":
+                    self.assertTrue(draft_review.current(worker.stage))
+                    (worker.stage / "制作记录.md").write_text("已复查 F1–3", encoding="utf-8")
+                    return
+                if name == "codex-repair":
+                    self.assertIn("后台制作只使用 Cycles", prompt)
+                    (worker.stage / "scene_details.py").unlink()
+                else:
+                    (worker.stage / "scene_details.py").write_text('scene.render.engine = "BLENDER_EEVEE"\n')
+                plan = dict(objects={"person": {"kind":"actor","palette_role":"lead"}},
+                            shots=[dict(start=1, end=3, description="人物",
+                                        camera=[dict(f=1, eye=[0,-4,1], aim=[0,0,1])],
+                                        tracks={"person":[{"f":1,"at":[0,0,0]}]})])
+                media.write_json(worker.stage / "shot-plan.json", plan)
+
+            with (patch.dict(os.environ, {"FILM_WORKER_FFMPEG":tools["ffmpeg"], "FILM_WORKER_FFPROBE":tools["ffprobe"]}),
+                  patch.object(worker, "run_model", side_effect=fixture)):
+                result = worker.run()
+            self.assertEqual(stages, ["codex", "codex-repair", "codex-self-review"])
+            manifest = media.read_json(Path(result["outputs"]["version_manifest"]))
+            self.assertNotIn("profile_hash", manifest)
+            self.assertEqual(manifest["frame_count"], 3)
+            with zipfile.ZipFile(result["outputs"]["scene_bundle"]) as saved:
+                self.assertIn(".actor-geometry.json", saved.namelist())
+
     @unittest.skipUnless(os.environ.get("FILM_WORKER_TEST_MEDIA") == "1", "requires Blender, FFmpeg and FFprobe")
     def test_prepare_revise_finalize_from_frozen_artifacts(self):
         tools = resolve_tools(DEFAULTS)

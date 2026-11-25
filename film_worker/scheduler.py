@@ -14,7 +14,8 @@ from pathlib import Path
 
 from .processes import ProcessTree
 from .protocol import Client, Interrupted, ProtocolError, Transfer, digest, key, opaque, valid_digest
-from .settings import KINDS, ROOT, atomic_json, environment, inspect_tools, object_hash, profile_matches, registration, resolve_tools
+from .settings import (KINDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
+                       production_settings, registration, resolve_tools, validate_config)
 from .state import State, identity, slot
 
 
@@ -125,6 +126,7 @@ class Events:
 
 class Scheduler:
     def __init__(self, config, root, token, *, test_http=False):
+        config = validate_config(config)
         self.cfg = config
         self.root = root
         self.state = State(root)
@@ -272,15 +274,11 @@ class Scheduler:
             raise ValueError("工单和输入清单的标识不一致")
         if object_hash(order) != assignment["input_manifest_sha256"]:
             raise ValueError("输入清单摘要不匹配")
-        profile = order["profile"]
-        if profile not in self.cfg["profiles"] or not profile_matches(profile, self.versions):
-            raise WorkFailure({"code":"profile_mismatch", "message":"本机无法履行冻结制作档案", "retryable":False})
         roles = {artifact["role"]: artifact for artifact in order["artifacts"]}
-        if (roles["source_video"]["size_bytes"] <= 0 or
-                len(roles) != len(order["artifacts"]) or any(roles[role]["sha256"] != profile["compatibility"][field]
-                for role, field in (("rules_bundle", "rules_sha256"), ("workflow_bundle", "workflow_sha256")))):
-            raise ValueError("工单规则、流程或原片摘要不符")
-        return profile, roles
+        if roles["source_video"]["size_bytes"] <= 0 or len(roles) != len(order["artifacts"]):
+            raise ValueError("工单包含空原片或重复的工件角色")
+        inputs = {role: artifact for role, artifact in roles.items() if role not in {"rules_bundle", "workflow_bundle"}}
+        return production_settings(self.cfg, self.versions, order), inputs
 
     def launch(self, assignment, deadline, pending=None):
         ident = identity(assignment)
@@ -457,6 +455,7 @@ class Scheduler:
         if not result_file.is_file():
             request = dict(assignment=assignment, paths=paths, tools=self.tools,
                            environment=environment(self.cfg, self.versions, profile),
+                           production=profile,
                            resources=str(self.root / "resources"), cpu_threads=self.cfg["cpu_threads"],
                            model_slots=self.cfg["model_slots"], render_slots=self.cfg["render_slots"])
             atomic_json(directory / "request.json", request)
@@ -527,8 +526,10 @@ class Scheduler:
                 def update(done, total):
                     atomic_json(directory / "progress.json", dict(stage="upload_" + role, completed=done, total=total))
                 outputs.append(transfer.upload(role, path, ROLE_TYPES[role], update, expected_sha=artifact["sha256"]))
-        payload = dict(input_manifest_sha256=assignment["input_manifest_sha256"], profile_hash=profile["profile_hash"],
+        payload = dict(input_manifest_sha256=assignment["input_manifest_sha256"],
                        environment=result["environment"], outputs=outputs)
+        if "profile_hash" in profile:
+            payload["profile_hash"] = profile["profile_hash"]
         if "final_verification" in result:
             payload["final_verification"] = result["final_verification"]
         self.state.mark(assignment, pending=payload)

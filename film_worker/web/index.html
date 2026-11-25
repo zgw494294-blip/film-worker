@@ -16,7 +16,7 @@
 <div class="row"><h2>节点配置</h2><button type="button" data-control="probe">检测本机工具</button></div>
 <fieldset><legend>连接</legend><div class="grid">
 <label>服务地址<input name="server" placeholder="https://workbench.example.com"></label>
-<label>节点标识<input name="node_key" autocomplete="off"></label>
+<label>节点标识（兼容旧服务）<input name="node_key" autocomplete="off"></label>
 <label>显示名称<input name="display_name"></label>
 <label>建模 Token<input name="token" type="password" placeholder="留空沿用已保存的 Token" autocomplete="new-password"></label>
 </div></fieldset>
@@ -29,17 +29,14 @@
 <label>预留磁盘 GiB<input name="disk_reserve_gib" type="number" min="1" max="128" required></label>
 <label>设备<select name="render_backend"><option>auto</option><option>cpu</option><option>metal</option><option>cuda</option><option>optix</option><option>hip</option><option>oneapi</option></select></label>
 </div></fieldset>
-<details open><summary>模型与制作档案</summary>
-<p>粘贴服务端冻结的档案数组。模型、推理强度和工作流程由档案指定。</p>
+<details open><summary>制作设置</summary>
 <div class="grid model">
-<label>当前档案<select id="profile-choice"></select></label>
-<label>服务商<input id="codex-provider"></label>
-<label>模型<input id="codex-model"></label>
-<label>推理强度<input id="codex-effort"></label>
+<label>服务商<input name="codex_provider" placeholder="使用本机 Codex 默认设置"></label>
+<label>模型<input name="codex_model" placeholder="使用本机 Codex 默认设置"></label>
+<label>推理强度<input name="reasoning_effort" placeholder="使用本机 Codex 默认设置"></label>
+
 </div>
-<div class="actions"><button id="draft-model" type="button">生成修改后的档案</button>
-<button id="test-model" type="button">测试已保存模型</button></div>
-<label>制作档案 JSON<textarea name="profiles" rows="7" spellcheck="false"></textarea></label>
+<div class="actions"><button id="test-model" type="button">测试已保存模型</button></div>
 </details>
 <details><summary>工具路径</summary><div class="grid">
 <label>Codex CLI<input name="codex"></label><label>Blender<input name="blender"></label>

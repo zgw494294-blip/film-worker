@@ -14,7 +14,7 @@ from . import model, startup
 from .releases import RESTART_FOR_UPDATE, Releases
 from .scheduler import Scheduler
 from .secrets import read_token, store_token
-from .settings import atomic_json, inspect_tools, load, registration, resolve_tools, validate_config
+from .settings import atomic_json, inspect_tools, load, resolve_tools, validate_config
 
 
 WEB = Path(__file__).with_name("web")
@@ -179,17 +179,11 @@ class Handler(BaseHTTPRequestHandler):
                 with node.lock:
                     startup.configure_login(node.root,payload.get("enabled"))
                     return self.reply(200, {"enabled":startup.login_enabled(node.root)})
-            if self.path == "/api/model-draft":
-                return self.reply(200, {"profile":model.draft(payload["base"],payload["model"])})
             if self.path == "/api/model-test":
                 if node.runner and node.runner.is_alive():
                     raise ValueError("请先暂停领单并停止节点，再验证模型")
                 config = load(node.config)
-                profile = next((profile for profile in config["profiles"]
-                                if profile["profile_hash"] == payload["profile_hash"]), None)
-                if profile is None:
-                    raise ValueError("请先保存要测试的制作档案")
-                answer = model.test(resolve_tools(config)["codex"], profile)
+                answer = model.test(resolve_tools(config)["codex"], config)
                 return self.reply(200,answer)
             with node.lock:
                 if self.path == "/api/config":
@@ -233,10 +227,6 @@ def serve(root, port, browser, *, test_http=False):
             # Confirm runtime, data format and panel bind before the launcher activates this release.
             from .selftest import check
             check(root)
-            config = load(server.config)
-            if os.environ.get("FILM_WORKER_RELEASE") and config["server"] and config["profiles"]:
-                local = inspect_tools(resolve_tools(config))
-                registration(config, "00000000-0000-0000-0000-000000000000", local)
             session = Path(os.environ["FILM_WORKER_LAUNCH"])
             atomic_json(session / "ready.json", {"port": server.server_port})
             deadline = time.monotonic() + 45

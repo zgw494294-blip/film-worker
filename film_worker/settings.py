@@ -17,6 +17,8 @@ from .protocol import opaque
 
 ROOT = Path(__file__).resolve().parent.parent
 KINDS = ["prepare", "revise", "finalize"]
+UPDATE_REMOTE = "https://github.com/zgw494294-blip/film-worker.git"
+MODEL_FIELDS = ("codex_model", "codex_provider", "reasoning_effort")
 
 DEFAULTS = {
     "server": "",
@@ -33,14 +35,16 @@ DEFAULTS = {
     "ffmpeg": "",
     "ffprobe": "",
     "render_backend": "auto",
-    "profiles": [],
-    "update_remote": "",
+    "codex_model": "",
+    "codex_provider": "",
+    "reasoning_effort": "",
+    "update_remote": UPDATE_REMOTE,
     "update_tag": "stable",
     "update_signers": "",
     "update_interval_minutes": 30,
     "update_window_start": "",
     "update_window_end": "",
-    "auto_update": False,
+    "auto_update": True,
 }
 
 
@@ -75,16 +79,20 @@ def bundled_release():
 
 def load(path):
     settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    if bundled := bundled_release():
-        bootstrap, manifest = bundled
-        signers = bootstrap / "release.allowed_signers"
-        if (remote := manifest.get("update_remote")) and signers.is_file():
-            settings = {"update_remote": remote, "update_signers": str(signers), "auto_update": True, **settings}
+    bootstrap, manifest = bundled_release() or (ROOT, {})
+    signers = bootstrap / "release.allowed_signers"
+    if not settings.get("update_remote"):
+        settings["update_remote"] = manifest.get("update_remote") or UPDATE_REMOTE
+    if not settings.get("update_signers") and signers.is_file():
+        settings["update_signers"] = str(signers)
     return validate_config(settings)
 
 
 def validate_config(settings):
-    config = {**DEFAULTS, **{k: v for k,v in settings.items() if k in DEFAULTS}}
+    legacy = settings.get("profiles", [])
+    model = legacy[0] if isinstance(legacy, list) and legacy and isinstance(legacy[0], dict) else {}
+    config = {**DEFAULTS, **{k: model[k] for k in MODEL_FIELDS if k in model},
+              **{k: v for k,v in settings.items() if k in DEFAULTS}}
     for field in ("slots", "model_slots", "render_slots", "transfer_slots", "cpu_threads", "disk_reserve_gib"):
         if type(config[field]) is not int or not 1 <= config[field] <= 128:
             raise ValueError(f"{field} 须为 1–128 的整数")
@@ -92,15 +100,16 @@ def validate_config(settings):
     if type(interval) is not int or not 1 <= interval <= 1440 or type(config["auto_update"]) is not bool:
         raise ValueError("更新周期须为 1–1440 分钟")
     for field in ("server", "node_key", "display_name", "codex", "blender", "ffmpeg", "ffprobe",
-                  "update_remote", "update_tag", "update_signers", "update_window_start", "update_window_end"):
+                  "update_remote", "update_tag", "update_signers", "update_window_start", "update_window_end",
+                  *MODEL_FIELDS):
         if not isinstance(config[field], str) or "\0" in config[field]:
             raise ValueError(f"{field} 格式错误")
     start,end = config["update_window_start"],config["update_window_end"]
     if (start or end) and (start==end or not all(re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", item)
                                                for item in (start,end))):
         raise ValueError("自动更新时段需填写不同的开始、结束时间（HH:MM）")
-    if not isinstance(config["profiles"], list) or any(not isinstance(p, dict) for p in config["profiles"]):
-        raise ValueError("制作档案应为 JSON 数组")
+    if any(config[k] and not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", config[k]) for k in MODEL_FIELDS):
+        raise ValueError("Codex 模型、服务商或推理强度格式错误")
     if config["render_backend"] not in {"auto", "cpu", "metal", "cuda", "optix", "hip", "oneapi"}:
         raise ValueError("未知 Blender 计算后端")
     return config
@@ -217,43 +226,40 @@ def inspect_tools(tools):
     return result
 
 
-def environment(config, versions, profile, evidence="configured", actual_backend=None):
+def environment(config, versions, profile=None, evidence="configured", actual_backend=None):
     mac = platform.system() == "Darwin"
     operating_system = "macOS " + platform.mac_ver()[0] if mac else "Windows " + platform.version()
     backend = config["render_backend"]
     if backend == "auto":
         backend = "metal" if mac and platform.machine() == "arm64" else "cpu"
-    source = profile if evidence != "unknown" else {}
+    source = {**(profile or {}), **{k: config[k] for k in MODEL_FIELDS if config.get(k)}} if evidence != "unknown" else {}
     return dict(os=operating_system, arch=platform.machine().lower(), gpu="auto", render_backend=actual_backend or backend,
-                compatibility={**profile["compatibility"], **versions}, model_evidence=evidence,
-                **{field: source.get(field) for field in ("codex_model", "codex_provider", "reasoning_effort")})
+                compatibility=dict(versions), model_evidence=evidence if all(source.get(k) for k in MODEL_FIELDS) else "unknown",
+                **{field: source.get(field) or None for field in MODEL_FIELDS})
 
 
-def profile_matches(profile, versions):
-    for field in ("codex_model", "codex_provider", "reasoning_effort"):
-        if not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", str(profile.get(field, ""))):
-            raise ValueError(f"制作档案的 {field} 格式错误")
-    advertised = profile["profile_hash"]
-    value = {k: v for k, v in profile.items() if k != "profile_hash"}
-    if object_hash(value) != advertised:
-        raise ValueError("制作档案摘要错误")
-    return all(profile["compatibility"][name] == value for name, value in versions.items())
+def production_settings(config, versions, order):
+    legacy = order.get("profile") or {}
+    result = {k: config.get(k, "") for k in MODEL_FIELDS}
+    result.update(final_width=legacy.get("final_width", 3840),
+                  review_landscape_limit=legacy.get("review_landscape_limit", {"width": 1920, "height": 1080}),
+                  review_portrait_limit=legacy.get("review_portrait_limit", {"width": 1080, "height": 1920}),
+                  compatibility=dict(versions),
+                  production_policy=order.get("production_policy", legacy.get("production_policy", "codex_trial")))
+    if fingerprint := legacy.get("profile_hash"):
+        result["profile_hash"] = fingerprint
+    return result
 
 
 def registration(config, instance_id, versions):
-    all_profiles = config["profiles"]
-    profiles = [p for p in all_profiles if profile_matches(p, versions)]
-    if not profiles:
-        if not all_profiles:
-            raise ValueError("尚未保存管理端签发的制作档案")
-        first = all_profiles[0]["compatibility"]
-        fields = [f"{name} 要求 {first[name]}，本机 {value}" for name,value in versions.items() if first[name] != value]
-        raise ValueError("制作档案不匹配 · " + "；".join(fields))
-    opaque(config["node_key"])
-    env = environment(config, versions, profiles[0])
+    node_key = config.get("node_key")
+    if node_key:
+        opaque(node_key)
+    env = environment(config, versions)
     available = sorted({"cpu", env["render_backend"]})
-    work_kinds = KINDS if any(p.get("production_policy") != "human_required" for p in profiles) else ["finalize"]
-    return dict(node_key=config["node_key"], instance_id=instance_id, display_name=config["display_name"],
-                capabilities=dict(work_kinds=work_kinds, profile_hashes=[p["profile_hash"] for p in profiles],
-                                  slots=config["slots"], max_frame_width=max(p["final_width"] for p in profiles),
-                                  render_backends=available, environment=env))
+    result = dict(instance_id=instance_id, display_name=config["display_name"],
+                  capabilities=dict(work_kinds=KINDS, slots=config["slots"], max_frame_width=3840,
+                                    render_backends=available, environment=env))
+    if node_key:
+        result["node_key"] = node_key
+    return result

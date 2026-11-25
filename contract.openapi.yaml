@@ -24,12 +24,11 @@ x-operational-contract:
     status，再处置本地缓存。
   重放: Idempotency-Key 的记录以令牌稳定主体、操作/目标资源和幂等键隔离，保留原响应及请求哈希。请求摘要是规范化正文以及资源/相关租约头的不可变身份摘要。相同键同内容复用原响应，不同内容返回 409。Complete
     的事务回执与 work、版本或交付记录共同持久保存；丢失响应必须在本地保留原字节/键/租约元组，同键重试或 GET status 查证。续租及查询无需幂等键。PUT part 以会话+序号+范围+摘要幂等。
-  正式批次: 档案 production_policy=human_required 时，服务端应将首制和返修交给人工制作流程；节点只在已审核基版明确标识 production_method=human 时执行正式出片。交付包 meta/video-technical.jsonl 记录同一 sample_id 下的三路媒体技术检查与黑帧结果。
+  正式批次: 工单 production_policy=human_required 时，服务端应将首制和返修交给人工制作流程；节点只在已审核基版明确标识 production_method=human 时执行正式出片。交付包 meta/video-technical.jsonl 记录同一 sample_id 下的三路媒体技术检查与黑帧结果。
   人工审核: |-
     prepare/revise 的 complete 原子发布一个可审核版本（review）。管理端在第一次人工领取时绑定该作业的 original_annotator_id。所有返修版的复核、逐帧通过、圈选、提交意见和已交付版的补充标注都只授权这个原标注员账号，管理员与其他标注员不能转派或代审。原账号暂不可用时保留给其本人处理。
-    服务端只有在当前版全部帧通过后才冻结完整 approval_manifest 并排入 finalize。finalize 核验后关联既有批准版本并发布交付（done）。返修制作可以重新分派到另一台具备相同所需能力和 profile 的制作节点；领取制作工单不会改变原标注员，机器令牌没有人工审核权限。
-  出片校验: finalize 在兼容的锁定环境重新校验原片/时间线/工程、review_bundle 逐帧无损素材、审批签名和输出配置。审片尺寸等于交付尺寸时可从已审无损白模帧编码；否则从已核验的同一工程、时间线和渲染配置按交付尺寸逐帧渲染，验证时序、输出画幅、完整性与所选
-    profile 的画面一致性条件。不得直接放大审片 JPEG 作为白模。变更工程或媒体身份应回到审核流程。
+    服务端只有在当前版全部帧通过后才冻结完整 approval_manifest 并排入 finalize。finalize 核验后关联既有批准版本并发布交付（done）。返修制作可以重新分派到另一台具备相同所需能力的制作节点；领取制作工单不会改变原标注员，机器令牌没有人工审核权限。
+  出片校验: finalize 在兼容的锁定环境重新校验原片/时间线/工程、review_bundle 逐帧无损素材、审批签名和输出配置。审片尺寸等于交付尺寸时可从已审无损白模帧编码；否则从已核验的同一工程、时间线和渲染配置按交付尺寸逐帧渲染，验证时序、输出画幅、完整性与审片画面一致性条件。不得直接放大审片 JPEG 作为白模。变更工程或媒体身份应回到审核流程。
   归档核验: 入库时管理端以有界缓冲逐件核验 ZIP 中央目录与实际数据，拒绝绝对路径、盘符、反斜线、上跳、空段、NUL、重复规范化路径、大小写/Unicode 碰撞、符号/硬链接、特殊文件及加密条目；限制解压总字节/条目数与压缩比。以规范相对路径将实际文件与索引逐一核对大小和
     SHA-256，拒绝多余、缺少、重名及引用越界内容。工件暂存成功不代表送审或交付成功。
   管理控制: pause/stop/delete 由管理端下发，执行端无相应控制写接口。pause 将任务置 paused 并收回租约，可由管理端恢复到 queued；stop/deleted 为终止。删除保留最小
@@ -66,7 +65,7 @@ paths:
       tags:
       - 节点
       summary: 注册建模节点
-      description: 使用管理端预发的、绑定 node_key 的建模令牌注册或恢复 Mac 节点。服务端校验 capabilities.environment.os 为 macOS 及版本号，其他系统返回 422/profile_mismatch。并发启动按 instance_id 和节点容量仲裁。该接口不签发模型服务密钥。
+      description: 使用管理端预发的 Bearer 建模令牌注册或恢复节点。兼容旧节点标识，制作档案不作为注册或领单条件。并发启动按 instance_id 和节点容量仲裁。该接口不签发模型服务密钥。
       parameters:
       - $ref: '#/components/parameters/Idempotency'
       requestBody:
@@ -181,7 +180,7 @@ paths:
       tags:
       - 工作
       summary: 按可用能力长轮询领取
-      description: 推荐 wait_seconds=25。服务端只分派兼容 profile 的工作并原子签出租约。只要上次领取结果不明，重试同一个键；204 后本次轮询结束，等待 Retry-After
+      description: 推荐 wait_seconds=25。服务端凭建模 Token、节点能力和可用槽位分派工单并原子签出租约。只要上次领取结果不明，重试同一个键；204 后本次轮询结束，等待 Retry-After
         秒并用新键轮询。
       parameters:
       - $ref: '#/components/parameters/Idempotency'
@@ -570,7 +569,7 @@ paths:
       - 工作
       summary: 提交并原子发布一次工作结果
       description: 鉴权后首先查询此节点、work_id、操作和幂等键的已提交回执；摘要（包括原 lease/fence/attempt 和规范化正文）一致即返回原 200，即使租约已过期或工作已结束。相同键异摘要返回
-        409/idempotency_conflict。未命中才校验当前租约、状态、控制、profile、输入与输出，并在同一事务提交工件引用、新版本或交付、工作状态及幂等回执。禁止新键或迟到 attempt
+        409/idempotency_conflict。未命中才校验当前租约、状态、控制、输入与输出，并在同一事务提交工件引用、新版本或交付、工作状态及幂等回执。禁止新键或迟到 attempt
         创建重复版本。
       parameters:
       - $ref: '#/components/parameters/WorkID'
@@ -1067,8 +1066,6 @@ components:
       - blender
       - ffmpeg
       - codex_cli
-      - workflow_sha256
-      - rules_sha256
       properties:
         runner_commit:
           type: string
@@ -1150,7 +1147,6 @@ components:
       additionalProperties: false
       required:
       - work_kinds
-      - profile_hashes
       - slots
       - max_frame_width
       - render_backends
@@ -1187,7 +1183,6 @@ components:
       type: object
       additionalProperties: false
       required:
-      - node_key
       - instance_id
       - capabilities
       properties:
@@ -1201,7 +1196,7 @@ components:
           minLength: 1
         capabilities:
           $ref: '#/components/schemas/Capabilities'
-      description: node_key 为管理端发放的稳定节点标识，须匹配 Bearer 的主体；instance_id 为执行进程本次启动 UUID。相同主体和 node_key 保持稳定 worker_id，服务端拒绝凭据冒认其他节点。
+      description: Bearer Token 确定节点身份。旧服务提供 node_key 时须匹配 Token。instance_id 是执行端稳定记录的实例标识。
     WorkerSession:
       type: object
       additionalProperties: false
@@ -1287,12 +1282,11 @@ components:
             $ref: '#/components/schemas/WorkKind'
           minItems: 1
           uniqueItems: true
-      description: 根据可用插槽与已注册能力领取一项任务；服务端同时检查 profile_hash、工具版本及输出能力。每次逻辑领取生成新幂等键；相同键重试不得产生第二笔租约。
+      description: 根据可用插槽与已注册能力领取一项任务；服务端核对建模 Token、节点会话及输出能力。每次逻辑领取生成新幂等键；相同键重试不得产生第二笔租约。
     Profile:
       type: object
       additionalProperties: false
       required:
-      - profile_hash
       - compatibility
       - final_width
       - color_policy
@@ -1347,7 +1341,6 @@ components:
       - kind
       - base_version
       - target_version
-      - profile
       - artifacts
       properties:
         schema_version:
@@ -1370,18 +1363,22 @@ components:
           minimum: 1
         profile:
           $ref: '#/components/schemas/Profile'
+          deprecated: true
+        production_policy:
+          type: string
+          enum: [codex_trial, human_required]
         export_quality:
           type: string
           enum: [1080p, 4k]
-          description: 仅 finalize 工单可传。1080p 将制作档案画幅按原比例限制在横屏 1920×1080 或竖屏 1080×1920，输出轴取最接近的偶数。4k 使用宽 3840 的制作档案。省略时按已通过版本的档案画幅出片。
+          description: 仅 finalize 工单可传。1080p 将画幅按原比例限制在横屏 1920×1080 或竖屏 1080×1920，输出轴取最接近的偶数。4k 使用基版的原生交付画幅，当前默认宽 3840。省略时沿用已通过版本原生交付画幅。
         artifacts:
           type: array
           items:
             $ref: '#/components/schemas/Artifact'
           minItems: 1
-      description: 每个角色仅一份。prepare 基版为 null，目标为 1；revise 目标=基版+1；finalize 目标=基版。均含 source_video、rules_bundle、workflow_bundle。revise
+      description: 每个角色仅一份。prepare 基版为 null，目标为 1；revise 目标=基版+1；finalize 目标=基版。均含 source_video。规则、流程和人体白模随执行端提供。revise
         另含 source_timeline、scene_bundle、shot_metadata、review_bundle、version_manifest、feedback_manifest 和 approval_manifest（已批子集）。finalize
-        另含上述既有版本输入及全部帧的 approval_manifest，feedback_manifest 可省。服务端保证关联同一作业和基版；节点校验哈希、版本和可复现环境。
+        另含上述既有版本输入及全部帧的 approval_manifest，feedback_manifest 可省。服务端保证关联同一作业和基版；节点校验工件摘要、作业身份及时间线。
       allOf:
       - if:
           required: [export_quality]
@@ -2095,7 +2092,6 @@ components:
       - base_manifest_sha256
       - source_sha256
       - timeline_sha256
-      - profile_hash
       - scene_sha256
       - scope
       - frame_count
@@ -2201,7 +2197,6 @@ components:
       - target_version
       - source_sha256
       - timeline_sha256
-      - profile_hash
       - scene_sha256
       - review_size
       - final_size
@@ -2249,7 +2244,6 @@ components:
       - source_sha256
       - timeline_sha256
       - input_manifest_sha256
-      - profile_hash
       - scene_sha256
       - scene_bundle_sha256
       - review_bundle_sha256
@@ -2364,7 +2358,6 @@ components:
       additionalProperties: false
       required:
       - input_manifest_sha256
-      - profile_hash
       - environment
       - outputs
       properties:

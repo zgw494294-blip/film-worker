@@ -72,10 +72,9 @@ async function openPanel() {
     for (const [key, value] of Object.entries(data.config)) {
       const field = form.elements.namedItem(key);
       if (field?.type === "checkbox") field.checked = value;
-      else if (field) field.value = key === "profiles" ? JSON.stringify(value, null, 2) : value;
+      else if (field) field.value = value;
     }
     document.querySelector("#address").textContent = data.config.server || "本机控制面板";
-    refreshProfiles();
   } catch (error) {
     message(error.message, true);
   }
@@ -89,13 +88,11 @@ form.addEventListener("submit", async event => {
     const config = Object.fromEntries(new FormData(form));
     const token = config.token;
     delete config.token;
-    config.profiles = JSON.parse(config.profiles);
     config.auto_update = form.elements.namedItem("auto_update").checked;
     for (const field of form.querySelectorAll("input[type=number]")) config[field.name] = Number(field.value);
     await api("config", {config, token});
     form.elements.namedItem("token").value = "";
     document.querySelector("#address").textContent = config.server || "本机控制面板";
-    refreshProfiles();
     message("配置已保存");
   } catch (error) {
     message(error.message, true);
@@ -116,60 +113,12 @@ document.querySelectorAll("[data-control]").forEach(button => {
     }
   });
 });
-const choice = document.querySelector("#profile-choice");
-const modelFields = {
-  codex_provider: document.querySelector("#codex-provider"),
-  codex_model: document.querySelector("#codex-model"),
-  reasoning_effort: document.querySelector("#codex-effort"),
-};
-const draft = form.elements.namedItem("profiles");
-
-function refreshProfiles() {
-  const profiles = JSON.parse(draft.value || "[]");
-  const index = Number(choice.value || 0);
-  choice.replaceChildren(...profiles.map((profile, order) => {
-    const option = document.createElement("option");
-    option.value = order;
-    option.textContent = `${profile.codex_model ?? "未配置"} · ${profile.profile_hash?.slice(0, 8) ?? "草稿"}`;
-    return option;
-  }));
-  if (index < profiles.length) choice.value = index;
-  selectProfile();
-}
-
-function selectProfile() {
-  const profile = JSON.parse(draft.value || "[]")[Number(choice.value)];
-  for (const [field, input] of Object.entries(modelFields)) input.value = profile?.[field] ?? "";
-  for (const id of ["draft-model", "test-model"]) document.querySelector("#" + id).disabled = !profile;
-}
-
-draft.addEventListener("change", () => {
-  try { refreshProfiles(); } catch (error) { message(error.message, true); }
-});
-choice.addEventListener("change", selectProfile);
-
-document.querySelector("#draft-model").addEventListener("click", async () => {
-  try {
-    const profiles = JSON.parse(draft.value);
-    const index = Number(choice.value);
-    const model = Object.fromEntries(Object.entries(modelFields).map(([k, input]) => [k, input.value.trim()]));
-    const changed = await api("model-draft", {base: profiles[index], model});
-    profiles[index] = changed.profile;
-    draft.value = JSON.stringify(profiles, null, 2);
-    refreshProfiles();
-    message("已生成新档案摘要。保存后需由管理员使用同一档案派发。");
-  } catch (error) {
-    message(error.message, true);
-  }
-});
-
 document.querySelector("#test-model").addEventListener("click", async event => {
   const button = event.currentTarget;
   button.disabled = true;
   message("正在测试本机 Codex 登录与模型");
   try {
-    const profile = JSON.parse(draft.value)[Number(choice.value)];
-    const response = await api("model-test", {profile_hash: profile.profile_hash});
+    const response = await api("model-test", {});
     const fields = Object.values(response.observed).filter(Boolean).join(" · ");
     message(fields ? "模型测试通过 · " + fields : "调用已通过，CLI 未提供实际模型标识");
   } catch (error) {
