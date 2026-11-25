@@ -12,6 +12,10 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
+REVIEW_STORAGE_HEADER = "X-Film-Worker-Review-Storage"
+LOCAL_REVIEW_MODE = "node_local_v1"
+
+
 class ProtocolError(Exception):
     def __init__(self, status, code, retryable=False, retry_after=None):
         super().__init__(f"HTTP {status}: {code}")

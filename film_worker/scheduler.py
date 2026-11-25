@@ -12,8 +12,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import bundles
 from .processes import ProcessTree
-from .protocol import Client, Interrupted, ProtocolError, Transfer, digest, key, opaque, valid_digest
+from .protocol import (LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER, Client, Interrupted, ProtocolError,
+                       Transfer, digest, key, opaque, valid_digest)
 from .settings import (KINDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
                        production_settings, registration, resolve_tools, validate_config)
 from .state import State, identity, slot
@@ -34,6 +36,11 @@ OUTPUT_ROLES = {
 
 def read(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def output_roles(assignment):
+    roles = OUTPUT_ROLES[assignment["kind"]]
+    return roles - {"scene_bundle"} if "review_storage" in assignment["input_manifest"] else roles
 
 
 class LeaseWatch:
@@ -197,7 +204,8 @@ class Scheduler:
                         payload = registration(self.cfg, self.instance_id, self.versions)
                         self.work_kinds = payload["capabilities"]["work_kinds"]
                         self.session, _ = self.api.json("POST", "/workers/register", body=payload,
-                                                         headers={"Idempotency-Key": key(self.instance_id, payload)})
+                                                         headers={"Idempotency-Key": key(self.instance_id, payload, LOCAL_REVIEW_MODE),
+                                                                  REVIEW_STORAGE_HEADER: LOCAL_REVIEW_MODE})
                         self.recover()
                     now = time.monotonic()
                     with self.lock:
@@ -278,7 +286,44 @@ class Scheduler:
         if roles["source_video"]["size_bytes"] <= 0 or len(roles) != len(order["artifacts"]):
             raise ValueError("工单包含空原片或重复的工件角色")
         inputs = {role: artifact for role, artifact in roles.items() if role not in {"rules_bundle", "workflow_bundle"}}
+        if "review_storage" in order:
+            if order["review_storage"] != {"mode": LOCAL_REVIEW_MODE, "instance_id": self.instance_id}:
+                raise WorkFailure(dict(code="input_invalid", message="本地审片工单未派给绑定的执行端实例", retryable=False))
+            required = {"source_video"}
+            if assignment["kind"] != "prepare":
+                required |= {"source_timeline", "shot_metadata", "version_manifest", "approval_manifest"}
+            if assignment["kind"] == "revise":
+                required.add("feedback_manifest")
+            if set(inputs) != required:
+                raise WorkFailure(dict(code="input_invalid", message="本地审片工单的输入角色不符", retryable=False))
         return production_settings(self.cfg, self.versions, order), inputs
+
+    def local_review_directory(self, assignment, sha):
+        sha = valid_digest(sha)
+        try:
+            retained = read(self.root / "local-reviews" / opaque(assignment["job_id"]) / (sha + ".json"))
+            number = retained["attempt"]
+            if type(number) is not int or number < 1:
+                raise ValueError("无效的本地尝试号")
+            folder = self.root / "work" / opaque(retained["work_id"]) / str(number)
+            manifest = folder / "out/version.json"
+            version = read(manifest)
+            if digest(manifest) != sha or version["review_storage"] != assignment["input_manifest"]["review_storage"]:
+                raise ValueError("本地版本摘要或执行端实例不符")
+            if not self.has_local_review(folder, version):
+                raise ValueError("本地审片产物不完整")
+            return folder
+        except (OSError, ValueError, KeyError, TypeError):
+            raise WorkFailure(dict(code="input_invalid", message="本机缺少可核验的基版产物，请恢复本机作业目录后重试",
+                                   retryable=False)) from None
+
+    @staticmethod
+    def has_local_review(folder, version):
+        scene = folder / "out/scene.zip"
+        return (scene.is_file() and digest(scene) == version["scene_bundle_sha256"]
+                and (folder / "out/review.zip").is_file()
+                and all((folder / "local-review" / bundles.safe_path(frame["white_png_path"])).is_file()
+                        for frame in version["frames"]))
 
     def launch(self, assignment, deadline, pending=None):
         ident = identity(assignment)
@@ -385,6 +430,7 @@ class Scheduler:
                 pass
         for work in {opaque(a["work_id"]) for a in records}:
             shutil.rmtree(self.root / "work" / work, ignore_errors=True)
+        shutil.rmtree(self.root / "local-reviews" / opaque(job), ignore_errors=True)
 
     def execute(self, assignment, deadline, heartbeat_seconds, current, pending):
         try:
@@ -418,6 +464,8 @@ class Scheduler:
                             report("download")
                             with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
                                 paths = {role: str(transfer.download(artifact, directory)) for role, artifact in artifacts.items()}
+                            if "review_storage" in assignment["input_manifest"] and assignment["kind"] != "prepare":
+                                paths["local_version"] = str(self.local_review_directory(assignment, artifacts["version_manifest"]["sha256"]))
                             if transfer.stop.is_set():
                                 raise Interrupted
                             pending = self.produce(assignment, profile, paths, directory, transfer, progress)
@@ -475,7 +523,7 @@ class Scheduler:
                 error = read(error_file) if error_file.is_file() else dict(code="render_failed", message="制作进程中止")
                 raise WorkFailure(dict(error, retryable=error["code"] not in {"input_invalid", "profile_mismatch"}))
         result = read(result_file)
-        if set(result["outputs"]) != OUTPUT_ROLES[assignment["kind"]]:
+        if set(result["outputs"]) != output_roles(assignment):
             raise ValueError("产物角色与工单类型不符")
         artifacts = {}
         for role, raw in result["outputs"].items():
@@ -498,7 +546,7 @@ class Scheduler:
             if (type(attempt) is not int or not 1 <= attempt <= assignment["lease"]["attempt"] or
                     checkpoint["input_manifest_sha256"] != assignment["input_manifest_sha256"] or
                     checkpoint["versions"] != self.versions or
-                    set(checkpoint["outputs"]) != OUTPUT_ROLES[assignment["kind"]]):
+                    set(checkpoint["outputs"]) != output_roles(assignment)):
                 return None
             for artifact in checkpoint["outputs"].values():
                 if stopped.is_set():
@@ -520,6 +568,13 @@ class Scheduler:
 
     def upload_result(self, assignment, profile, result, directory, transfer):
         outputs = []
+        if "review_storage" in assignment["input_manifest"] and "version_manifest" in result["outputs"]:
+            manifest = result["outputs"]["version_manifest"]
+            version = self.checkpoint_path(directory, result["attempt"], manifest)
+            if not self.has_local_review(version.parent.parent, read(version)):
+                raise WorkFailure(dict(code="input_invalid", message="本机送审版的无损帧或工程缺失，已停止送审", retryable=False))
+            atomic_json(self.root / "local-reviews" / opaque(assignment["job_id"]) / (manifest["sha256"] + ".json"),
+                        dict(work_id=transfer.work, attempt=result["attempt"]))
         with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
             for role, artifact in result["outputs"].items():
                 path = self.checkpoint_path(directory, result["attempt"], artifact)

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: 电影复刻 · 建模执行端接口
-  version: 1.0.0
+  version: 1.1.0
   description: '公网管理端提供的 HTTPS 出站拉取协议。服务端权威保存作业、版本、审批、工件和交付。建模节点只需访问一个管理端地址，以节点令牌领取、续租、上报和回传。节点合同与管理端 UI 用户接口独立。
 
     建模执行端运行在 Mac 上。下列标识、角色、路径、状态、哈希算法及字节范围用于管理端与各台 Mac 之间互操作。工件清单中的 JSON 是 UTF-8 文件；普通工件哈希针对实际文件字节，明确标有 JCS 的字段才对规范化 JSON 计算哈希。HTTP
@@ -19,7 +19,7 @@ tags:
 - name: 工作
 - name: 工件
 x-operational-contract:
-  授权: 建模令牌由管理端预发或轮换，一枚令牌绑定一个 node_key。所有操作验证 Bearer 和节点/工作归属。节点侧供应商及模型登录由节点自己配置，不随建模令牌、能力快照、事件、日志或工件上传。撤销令牌应立即拒绝新请求。
+  授权: 建模令牌由管理端预发或轮换，node_key 为兼容旧服务的可选字段。所有操作验证 Bearer 和节点、工单归属。节点侧供应商及模型登录由节点自己配置，不随建模令牌、能力快照、事件、日志或工件上传。撤销令牌应立即拒绝新请求。
   租约: attempt 对同一工作从 1 递增，重分派同时提升 fence，撤销旧租约。节点自身的并发上限由 slots 提示并由服务端原子限制。管理端时间为准，服务端对持租写验核 worker、lease_id、fence、attempt、终态与控制状态；上报进度、传分段、上传完成均不自动续租。工作心跳与长任务、上传并行执行。发生状态冲突后节点查询
     status，再处置本地缓存。
   重放: Idempotency-Key 的记录以令牌稳定主体、操作/目标资源和幂等键隔离，保留原响应及请求哈希。请求摘要是规范化正文以及资源/相关租约头的不可变身份摘要。相同键同内容复用原响应，不同内容返回 409。Complete
@@ -27,8 +27,9 @@ x-operational-contract:
   正式批次: 工单 production_policy=human_required 时，服务端应将首制和返修交给人工制作流程；节点只在已审核基版明确标识 production_method=human 时执行正式出片。交付包 meta/video-technical.jsonl 记录同一 sample_id 下的三路媒体技术检查与黑帧结果。
   人工审核: |-
     prepare/revise 的 complete 原子发布一个可审核版本（review）。管理端在第一次人工领取时绑定该作业的 original_annotator_id。所有返修版的复核、逐帧通过、圈选、提交意见和已交付版的补充标注都只授权这个原标注员账号，管理员与其他标注员不能转派或代审。原账号暂不可用时保留给其本人处理。
-    服务端只有在当前版全部帧通过后才冻结完整 approval_manifest 并排入 finalize。finalize 核验后关联既有批准版本并发布交付（done）。返修制作可以重新分派到另一台具备相同所需能力的制作节点；领取制作工单不会改变原标注员，机器令牌没有人工审核权限。
-  出片校验: finalize 在兼容的锁定环境重新校验原片/时间线/工程、review_bundle 逐帧无损素材、审批签名和输出配置。审片尺寸等于交付尺寸时可从已审无损白模帧编码；否则从已核验的同一工程、时间线和渲染配置按交付尺寸逐帧渲染，验证时序、输出画幅、完整性与审片画面一致性条件。不得直接放大审片 JPEG 作为白模。变更工程或媒体身份应回到审核流程。
+    服务端只有在当前版全部帧通过后才冻结完整 approval_manifest 并排入 finalize。finalize 核验后关联既有批准版本并发布交付（done）。集中存储作业按原协议调度。同机作业以首制绑定的 instance_id 领取所有制作工单；领取制作工单不会改变原标注员，机器令牌没有人工审核权限。
+  出片校验: finalize 在兼容的锁定环境重新校验原片、时间线、工程、无损白模帧、审批签名和输出配置。同机模式取本机冻结的无损帧与工程，集中存储模式从工件读取。审片尺寸等于交付尺寸时可从已审无损白模帧编码；否则从已核验的同一工程、时间线和渲染配置按交付尺寸逐帧渲染，验证时序、输出画幅、完整性与审片画面一致性条件。不得直接放大审片 JPEG 作为白模。变更工程或媒体身份应回到审核流程。
+  同机审片: 同机模式仅对新作业首制启用。服务端在发放首制租约时原子绑定作业与已注册、声明支持的 instance_id，并冻结 review_storage。续领、暂停恢复、返修、出片和补充返修沿用绑定，实例离线时等待原实例恢复。只在最终交付时回传工程和成片。
   归档核验: 入库时管理端以有界缓冲逐件核验 ZIP 中央目录与实际数据，拒绝绝对路径、盘符、反斜线、上跳、空段、NUL、重复规范化路径、大小写/Unicode 碰撞、符号/硬链接、特殊文件及加密条目；限制解压总字节/条目数与压缩比。以规范相对路径将实际文件与索引逐一核对大小和
     SHA-256，拒绝多余、缺少、重名及引用越界内容。工件暂存成功不代表送审或交付成功。
   管理控制: pause/stop/delete 由管理端下发，执行端无相应控制写接口。pause 将任务置 paused 并收回租约，可由管理端恢复到 queued；stop/deleted 为终止。删除保留最小
@@ -68,6 +69,12 @@ paths:
       description: 使用管理端预发的 Bearer 建模令牌注册或恢复节点。兼容旧节点标识，制作档案不作为注册或领单条件。并发启动按 instance_id 和节点容量仲裁。该接口不签发模型服务密钥。
       parameters:
       - $ref: '#/components/parameters/Idempotency'
+      - name: X-Film-Worker-Review-Storage
+        in: header
+        required: false
+        schema:
+          const: node_local_v1
+        description: 此次注册的实例支持同机审片。旧版可省略。仅服务端给工单加 review_storage 时启用。
       requestBody:
         required: true
         content:
@@ -1331,6 +1338,17 @@ components:
         dw、dh 为应用旋转与像素宽高比后的有效显示宽高，必须均为正数。零、负值或无有效面积的画幅拒绝送审。最终 W 默认 3840，H = max(2, 2*round((W*dh/dw)/2))；历史版使用冻结的交付尺寸。
         以最终 W、H 为基准，W≥H 取横屏上限 (1920,1080)，否则取竖屏上限 (1080,1920)。scale = min(1,max_width/W,max_height/H)。审核尺寸分别为 max(1,round(W*scale))、max(1,round(H*scale))。
         比值均按精确有理数运算，round 取最近整数，恰为一半时取偶数；审核宽和高允许奇数。例如 3840×2154 送审为 1920×1077。
+    LocalReviewStorage:
+      type: object
+      additionalProperties: false
+      required: [mode, instance_id]
+      properties:
+        mode:
+          const: node_local_v1
+        instance_id:
+          type: string
+          format: uuid
+      description: 绑定注册实例。所有工单和送审版本使用完全相同的值。
     InputManifest:
       type: object
       additionalProperties: false
@@ -1371,14 +1389,17 @@ components:
           type: string
           enum: [1080p, 4k]
           description: 仅 finalize 工单可传。1080p 将画幅按原比例限制在横屏 1920×1080 或竖屏 1080×1920，输出轴取最接近的偶数。4k 使用基版的原生交付画幅，当前默认宽 3840。省略时沿用已通过版本原生交付画幅。
+        review_storage:
+          $ref: '#/components/schemas/LocalReviewStorage'
         artifacts:
           type: array
           items:
             $ref: '#/components/schemas/Artifact'
           minItems: 1
-      description: 每个角色仅一份。prepare 基版为 null，目标为 1；revise 目标=基版+1；finalize 目标=基版。均含 source_video。规则、流程和人体白模随执行端提供。revise
-        另含 source_timeline、scene_bundle、shot_metadata、review_bundle、version_manifest、feedback_manifest 和 approval_manifest（已批子集）。finalize
-        另含上述既有版本输入及全部帧的 approval_manifest，feedback_manifest 可省。服务端保证关联同一作业和基版；节点校验工件摘要、作业身份及时间线。
+      description: >-
+        每个角色仅一份。prepare 基版为 null，目标为 1。revise 目标为基版加一。finalize 目标为基版。
+        有 review_storage 的作业只向绑定实例发放，返修和出片从本机读取审片 ZIP 与工程。
+        服务端保证关联同一作业和基版。节点校验工件摘要、作业身份及时间线。
       allOf:
       - if:
           required: [export_quality]
@@ -1401,24 +1422,6 @@ components:
                   properties:
                     role:
                       const: source_video
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
-                      const: workflow_bundle
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
-                      const: rules_bundle
                 minContains: 1
                 maxContains: 1
             base_version:
@@ -1448,24 +1451,6 @@ components:
                   - role
                   properties:
                     role:
-                      const: workflow_bundle
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
-                      const: rules_bundle
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
                       const: source_timeline
                 minContains: 1
                 maxContains: 1
@@ -1475,25 +1460,7 @@ components:
                   - role
                   properties:
                     role:
-                      const: scene_bundle
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
                       const: shot_metadata
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
-                      const: review_bundle
                 minContains: 1
                 maxContains: 1
               - contains:
@@ -1549,24 +1516,6 @@ components:
                   - role
                   properties:
                     role:
-                      const: workflow_bundle
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
-                      const: rules_bundle
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
                       const: source_timeline
                 minContains: 1
                 maxContains: 1
@@ -1576,25 +1525,7 @@ components:
                   - role
                   properties:
                     role:
-                      const: scene_bundle
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
                       const: shot_metadata
-                minContains: 1
-                maxContains: 1
-              - contains:
-                  type: object
-                  required:
-                  - role
-                  properties:
-                    role:
-                      const: review_bundle
                 minContains: 1
                 maxContains: 1
               - contains:
@@ -1618,6 +1549,66 @@ components:
             base_version:
               type: integer
               minimum: 1
+      - if:
+          not:
+            required: [review_storage]
+          properties:
+            kind:
+              enum: [revise, finalize]
+        then:
+          properties:
+            artifacts:
+              allOf:
+              - contains:
+                  required: [role]
+                  properties:
+                    role:
+                      const: scene_bundle
+                minContains: 1
+                maxContains: 1
+              - contains:
+                  required: [role]
+                  properties:
+                    role:
+                      const: review_bundle
+                minContains: 1
+                maxContains: 1
+      - if:
+          required: [review_storage]
+          properties:
+            kind:
+              const: prepare
+        then:
+          properties:
+            artifacts:
+              items:
+                properties:
+                  role:
+                    enum: [source_video]
+      - if:
+          required: [review_storage]
+          properties:
+            kind:
+              const: revise
+        then:
+          properties:
+            artifacts:
+              items:
+                properties:
+                  role:
+                    enum: [source_video, source_timeline, shot_metadata, version_manifest, approval_manifest, feedback_manifest]
+      - if:
+          required: [review_storage]
+          properties:
+            kind:
+              const: finalize
+        then:
+          properties:
+            artifacts:
+              items:
+                properties:
+                  role:
+                    enum: [source_video, source_timeline, shot_metadata, version_manifest, approval_manifest]
     Lease:
       type: object
       additionalProperties: false
@@ -2176,6 +2167,7 @@ components:
         white_png_path:
           type: string
           minLength: 1
+          description: 同机模式下为执行端本机相对路径。
       description: PNG 为实际渲染的无损 RGB 白模，JPEG 为送审用上下合图。签名来自锁定算法对精确无损图像与源片时间身份的计算，不以 JPEG 字节代替。
       x-signature-test-vector:
         source_sha256: '0000000000000000000000000000000000000000000000000000000000000000'
@@ -2214,6 +2206,8 @@ components:
           $ref: '#/components/schemas/Sha256'
         timeline_sha256:
           $ref: '#/components/schemas/Sha256'
+        review_storage:
+          $ref: '#/components/schemas/LocalReviewStorage'
         profile_hash:
           $ref: '#/components/schemas/Sha256'
         scene_sha256:
@@ -2232,8 +2226,20 @@ components:
           items:
             $ref: '#/components/schemas/ReviewFrame'
           minItems: 1
-      description: review_bundle 为 ZIP，根目录 index.json 符合本结构；files 索引除自身外的每个文件，涵盖所有白模 PNG、上下对比 JPEG，可含锁定的无损源帧。逐帧编号与清单一致；每个路径均须能在
-        files 中唯一定位。管理端验证大小、哈希、图形格式、单幅/双幅尺寸和帧覆盖后才入库。
+      description: >-
+        ZIP 根目录含 index.json。files 逐一索引 ZIP 内的其他文件。集中存储时包含上下对比 JPEG 和白模 PNG。
+        同机模式只含 pairs/*.jpg，各帧的 white_png_path 指向执行端本机文件，服务端无需读取。
+        管理端验证 ZIP 内实际条目的大小、SHA-256、JPEG 尺寸及帧覆盖后才入库。
+      allOf:
+      - if:
+          required: [review_storage]
+        then:
+          properties:
+            files:
+              items:
+                properties:
+                  path:
+                    pattern: '^pairs/[0-9]+[.]jpg$'
     VersionManifest:
       type: object
       additionalProperties: false
@@ -2268,6 +2274,8 @@ components:
           $ref: '#/components/schemas/Sha256'
         input_manifest_sha256:
           $ref: '#/components/schemas/Sha256'
+        review_storage:
+          $ref: '#/components/schemas/LocalReviewStorage'
         profile_hash:
           $ref: '#/components/schemas/Sha256'
         scene_sha256:
@@ -2299,7 +2307,7 @@ components:
         environment:
           $ref: '#/components/schemas/NodeEnvironment'
       description: version_manifest 工件 UTF-8 JSON；frames 必须与审片包 index.json 完全一致。scene_sha256 为可编辑 scene.blend
-        文件字节哈希，scene_bundle_sha256 为包含该工程、依赖和文件索引的 ZIP 哈希。
+        文件字节哈希，scene_bundle_sha256 为工程 ZIP 哈希。同机模式下工程 ZIP 留在本机，交付归档内的 scene.blend 仍须匹配 scene_sha256。
     ShotMetadata:
       type: object
       additionalProperties: false
@@ -2374,9 +2382,12 @@ components:
           minItems: 1
         final_verification:
           $ref: '#/components/schemas/FinalVerification'
-      description: 每个输出角色仅一件，须来自本 work 的已封存 upload。prepare 交 source_timeline、scene_bundle、shot_metadata、review_bundle、version_manifest、production_report；revise
-        交同一组但复用源时间线，无须再上传 source_timeline；finalize 交 white_video、comparison_video、delivery_bundle。管理端核验消重并按
-        kind 原子发布。
+      description: >-
+        每个输出角色仅一件，须来自本 work 已封存的 upload。prepare 提交 source_timeline、shot_metadata、
+        review_bundle、version_manifest、production_report，revise 复用源时间线。
+        集中存储时 prepare 和 revise 还提交 scene_bundle。同机模式下工程留在绑定实例。
+        finalize 在两种模式下均提交 white_video、comparison_video、delivery_bundle。
+        管理端按已冻结的工单模式核验并原子发布。
       allOf:
       - if:
           properties:

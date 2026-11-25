@@ -62,10 +62,15 @@ class Production:
         self.request = request
         self.order = request["assignment"]["input_manifest"]
         self.kind = self.order["kind"]
+        self.review_storage = self.order.get("review_storage")
         self.profile = request.get("production") or self.order.get("profile") or {}
         self.env = request["environment"].copy()
         self.tools = request["tools"]
         self.sources = {key: Path(path) for key, path in request["paths"].items()}
+        self.local_version = self.sources.pop("local_version", None)
+        if self.local_version is not None:
+            self.sources.update(scene_bundle=self.local_version / "out/scene.zip",
+                                review_bundle=self.local_version / "out/review.zip")
         self.stage = directory / "scene"
         self.stage.mkdir(exist_ok=True)
         self.output = directory / "out"
@@ -158,12 +163,15 @@ class Production:
             raise ValueError("基版的作业、版号、原片或时间线不符")
         if quality.policy(self.profile) == "human_required" and base.get("production_method") != "human":
             raise ValueError("正式出片缺少已审核的人工作品来源")
+        if base.get("review_storage") != self.review_storage:
+            raise ValueError("基版审片存储模式或绑定实例不符")
         self.previous = base
         self.review_size = size(base["review_size"])
         if size(base["final_size"]) != self.final_size:
             raise ValueError("基版交付画幅不符")
         self.prior_scene = self.root / "prior-scene"
         self.prior_review = self.root / "prior-review"
+        self.prior_white = self.local_version / "local-review" if self.local_version is not None else self.prior_review
         for target in (self.prior_scene, self.prior_review):
             if target.exists():
                 shutil.rmtree(target)
@@ -177,15 +185,15 @@ class Production:
                 base["review_bundle_sha256"], base["shot_metadata_sha256"]):
             raise ValueError("基版工程或审片文件已变更")
         if any(review.get(k) != base.get(k) for k in (
-                "job_id", "source_sha256", "timeline_sha256", "review_size", "final_size", "frames")):
+                "job_id", "source_sha256", "timeline_sha256", "review_size", "final_size", "frames", "review_storage")):
             raise ValueError("基版审核索引不匹配")
         if [f["number"] for f in base["frames"]] != list(range(1, self.count + 1)):
             raise ValueError("审核帧索引不连续")
         for frame, pts in zip(base["frames"], self.timeline["pts"], strict=True):
             if frame["pts"] != pts:
                 raise ValueError("审核索引与 PTS 不符")
-            for role in ("pair_jpeg_path", "white_png_path"):
-                file = self.prior_review / bundles.safe_path(frame[role])
+            for folder, role in ((self.prior_review, "pair_jpeg_path"), (self.prior_white, "white_png_path")):
+                file = folder / bundles.safe_path(frame[role])
                 if not file.is_file():
                     raise ValueError("审核帧图片缺失")
 
@@ -268,8 +276,9 @@ class Production:
                       scene_bundle)
         rendered = self.render(scene, self.review_size, "review")
         review_root = self.root / "review-bundle"
+        white_root = self.root / "local-review" if self.review_storage else review_root
         (review_root / "pairs").mkdir(parents=True, exist_ok=True)
-        (review_root / "white").mkdir(exist_ok=True)
+        (white_root / "white").mkdir(parents=True, exist_ok=True)
         frames = []
         prior = {row["number"]: row for row in self.previous["frames"]} if self.previous else {}
         for i, pts in enumerate(self.timeline["pts"], 1):
@@ -284,13 +293,15 @@ class Production:
                 shutil.copyfile(self.prior_review / bundles.safe_path(prior[i]["pair_jpeg_path"]), target)
             else:
                 pair.save(target, quality=94, subsampling=0)
-            shutil.copyfile(png, review_root / png_name)
+            shutil.copyfile(png, white_root / png_name)
             frames.append(dict(number=i, pts=pts, review_signature=signature, pair_jpeg_path=jpg_name, white_png_path=png_name))
         common = dict(schema_version=1, job_id=self.order["job_id"], source_sha256=self.timeline["source_sha256"],
                       timeline_sha256=self.timeline_sha, scene_sha256=scene_sha,
                       review_size=dimensions(self.review_size), final_size=dimensions(self.final_size), frames=frames)
         if "profile_hash" in self.profile:
             common["profile_hash"] = self.profile["profile_hash"]
+        if self.review_storage:
+            common["review_storage"] = self.review_storage
         review_bundle = self.output / "review.zip"
         bundles.build(review_root, dict(common, target_version=self.order["target_version"]), review_bundle)
         report = self.output / "production.json"
@@ -305,6 +316,8 @@ class Production:
                                         environment=self.env))
         outputs = dict(scene_bundle=scene_bundle, shot_metadata=metadata, review_bundle=review_bundle,
                        version_manifest=manifest, production_report=report)
+        if self.review_storage:
+            del outputs["scene_bundle"]
         if self.kind == "prepare":
             outputs["source_timeline"] = self.timeline_file
         return dict(outputs={k: str(v) for k,v in outputs.items()}, environment=self.env)
@@ -473,7 +486,7 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
         _, approved = self.approval()
         self.progress("verify_review", 0, self.count)
         for n, frame in approved.items():
-            white = media.rgb(self.prior_review / bundles.safe_path(frame["white_png_path"]))
+            white = media.rgb(self.prior_white / bundles.safe_path(frame["white_png_path"]))
             pair = media.comparison(self.frames, white, n)
             if white.size != self.review_size or media.signature(pair, self.timeline, n) != frame["review_signature"]:
                 raise ValueError(f"第 {n} 帧审核像素签名核验失败")
@@ -481,7 +494,7 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
         approved_native = self.review_size == output_size
         if approved_native:
             def render_white(n):
-                return media.rgb(self.prior_review / bundles.safe_path(approved[n]["white_png_path"]))
+                return media.rgb(self.prior_white / bundles.safe_path(approved[n]["white_png_path"]))
         else:
             rendered = self.render(self.scene_file, output_size, "final")
             def render_white(n):

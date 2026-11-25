@@ -13,8 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from film_worker.protocol import Interrupted
-from film_worker.scheduler import Scheduler
+from film_worker.protocol import Interrupted, LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER
+from film_worker.scheduler import Scheduler, WorkFailure
 from film_worker.settings import DEFAULTS, atomic_json, environment, object_hash
 
 
@@ -48,6 +48,7 @@ class ProductionMock(ThreadingHTTPServer):
                             review_portrait_limit={"width":1080,"height":1920})
         self.profile["profile_hash"] = object_hash(self.profile)
         self.registered = []
+        self.review_storage = {}
         self.workers = {}
         self.queue = []
         self.attempts = {}
@@ -82,7 +83,7 @@ class ProductionMock(ThreadingHTTPServer):
             return [r for r in receipt["artifacts"] if r["role"] in roles]
 
     def schedule(self, kind, version, *, slug=None, job="job1", attempt=1, drop_reply=False,
-                 artifacts=None, export_quality=None, legacy_profile=False):
+                 artifacts=None, export_quality=None, legacy_profile=False, review_storage=None):
         work = f"work-{slug or kind}"
         artifacts = artifacts or [dict(artifact_id="asset", role=role, sha256=sha(self.input), size_bytes=len(self.input),
                           media_type="application/octet-stream")
@@ -94,6 +95,8 @@ class ProductionMock(ThreadingHTTPServer):
             order["profile"] = self.profile
         if export_quality is not None:
             order["export_quality"] = export_quality
+        if review_storage is not None:
+            order["review_storage"] = review_storage
         assignment = dict(job_id=job, work_id=work, kind=kind, input_manifest=order,
                           input_manifest_sha256=object_hash(order),
                           lease=dict(lease_id=f"lease-{work}-{attempt}", fence=6+attempt,
@@ -141,6 +144,7 @@ class Fixture(BaseHTTPRequestHandler):
             if path=="workers/register":
                 server.registered.append(payload)
                 worker = server.workers.setdefault(payload.get("node_key", "bearer-node"),f"node-{len(server.workers)+1}")
+                server.review_storage[worker,payload["instance_id"]] = self.headers.get(REVIEW_STORAGE_HEADER)
                 return self.answer(200, dict(worker_id=worker, server_time=now(), heartbeat_seconds=30,
                                             claim_wait_max_seconds=25, lease_seconds=90, lease_heartbeat_seconds=server.heartbeat_interval,
                                             part_size_bytes=8388608))
@@ -150,7 +154,13 @@ class Fixture(BaseHTTPRequestHandler):
                 if payload["worker_id"] not in server.workers.values():
                     return self.answer(403,{"code":"worker_unknown"})
                 if token not in server.claims:
-                    assignment = server.queue.pop(0) if server.queue else None
+                    def eligible(candidate):
+                        owner = candidate["input_manifest"].get("review_storage")
+                        identity = payload["worker_id"], payload["instance_id"]
+                        return owner is None or (owner["instance_id"] == identity[1] and
+                                                 server.review_storage.get(identity) == LOCAL_REVIEW_MODE)
+                    index = next((i for i,candidate in enumerate(server.queue) if eligible(candidate)),None)
+                    assignment = server.queue.pop(index) if index is not None else None
                     if assignment:
                         assignment["lease"]["worker_id"] = payload["worker_id"]
                     server.claims[token] = assignment
@@ -257,7 +267,10 @@ class Fixture(BaseHTTPRequestHandler):
             server.commit_calls.setdefault(work, []).append((lease["attempt"], token, payload))
             if work in server.hold_commits:
                 return self.answer(503, {"code":"unavailable", "retryable":True})
-            if ({r["role"] for r in payload["outputs"]} != set(ROLES[kind]) or
+            roles = set(ROLES[kind])
+            if "review_storage" in attempt["assignment"]["input_manifest"]:
+                roles.discard("scene_bundle")
+            if ({r["role"] for r in payload["outputs"]} != roles or
                     any(server.uploads.get(o["artifact_id"],{}).get("artifact")!=o for o in payload["outputs"])):
                 return self.answer(422,{"code":"invalid_manifest"})
             if "receipt" in attempt:
@@ -327,6 +340,25 @@ def fixture_outputs(node, assignment, profile, paths, directory, transfer, progr
 
 
 class WorkerFlow(unittest.TestCase):
+    def test_local_review_rejects_wrong_instance_and_missing_frozen_version(self):
+        with tempfile.TemporaryDirectory(prefix="worker-local-review-") as folder, mock_service() as service, patch(
+                "film_worker.scheduler.resolve_tools", return_value={}), patch(
+                "film_worker.scheduler.inspect_tools", return_value=VERSIONS):
+            owner = Scheduler(node_config(service), Path(folder)/"owner", "fixture", test_http=True)
+            other = Scheduler(node_config(service), Path(folder)/"other", "fixture", test_http=True)
+            try:
+                storage = {"mode": LOCAL_REVIEW_MODE, "instance_id": owner.instance_id}
+                work = service.schedule("prepare", 1, review_storage=storage)
+                order = service.attempts[work]["assignment"]
+                with self.assertRaisesRegex(WorkFailure, "未派给绑定的执行端"):
+                    other.check_assignment(order)
+                owner.check_assignment(order)
+                with self.assertRaisesRegex(WorkFailure, "本机缺少可核验的基版产物"):
+                    owner.local_review_directory(order, sha(b"missing manifest"))
+            finally:
+                owner.pool.shutdown()
+                other.pool.shutdown()
+
     def test_registration_to_review_and_final_delivery_with_lost_receipt(self):
         with tempfile.TemporaryDirectory(prefix="worker-flow-") as folder, mock_service() as service:
             service.schedule("prepare",1,drop_reply=True)

@@ -17,6 +17,7 @@ from PIL import Image
 
 from film_worker import intake, media
 from film_worker.processes import ProcessTree
+from film_worker.protocol import LOCAL_REVIEW_MODE
 from film_worker.scheduler import Scheduler
 from film_worker.settings import DEFAULTS, MODEL_FIELDS, ROOT, resolve_tools
 from test_server_flow import mock_service, node_config, sha
@@ -82,6 +83,12 @@ class WholeMediaSimulation(unittest.TestCase):
     def test_finalize_can_select_1080p_after_approval_for_a_4k_native_scene(self):
         self.roundtrip(variable=False, export_quality="1080p")
 
+    def test_same_node_review_uploads_comparisons_only_and_exports_1080p_after_restart(self):
+        self.roundtrip(variable=False, export_quality="1080p", local_review=True)
+
+    def test_same_node_review_uses_frozen_local_scene_for_4k(self):
+        self.roundtrip(variable=False, export_quality="4k", local_review=True)
+
     @unittest.skipUnless(os.getenv("FILM_WORKER_TEST_REAL_CODEX")=="1","requires a locally authenticated Codex")
     def test_real_codex_authors_and_revises_work_received_from_the_mock_manager(self):
         model = {field: os.environ["FILM_TEST_"+field.upper()] for field in MODEL_FIELDS}
@@ -117,7 +124,7 @@ class WholeMediaSimulation(unittest.TestCase):
                         preview = review.getpixel((round(sample_x * 320 / 96), review.height//2))
                         self.assertAlmostEqual(preview[0],sdr_value,delta=6)
 
-    def roundtrip(self, *, variable, model=None, export_quality=None):
+    def roundtrip(self, *, variable, model=None, export_quality=None, local_review=False):
         with tempfile.TemporaryDirectory(prefix="worker-local-manager-") as directory, mock_service() as service:
             root = Path(directory)
             data = root/"节点 数据"
@@ -143,9 +150,10 @@ class WholeMediaSimulation(unittest.TestCase):
             scene_authoring = nullcontext() if model else patch("film_worker.scheduler.ProcessTree",start_fixture)
             with scene_authoring:
                 node = Scheduler(config,data,"fixture",test_http=True)
+                storage = {"mode": LOCAL_REVIEW_MODE, "instance_id": node.instance_id} if local_review else None
                 worker = threading.Thread(target=node.run)
                 try:
-                    first = service.schedule("prepare",1,artifacts=list(defaults.values()))
+                    first = service.schedule("prepare",1,artifacts=list(defaults.values()),review_storage=storage)
                     worker.start()
                     self.wait_work(service,node,first,timeout)
                     self.assertEqual(service.completed,[first],"人工审核前应等待")
@@ -162,6 +170,17 @@ class WholeMediaSimulation(unittest.TestCase):
                     self.assertEqual(len(version1["frames"]),3)
                     with zipfile.ZipFile(io.BytesIO(artifacts["review_bundle"])) as reviews:
                         self.assertIn(frame1["pair_jpeg_path"],reviews.namelist())
+                        self.assertEqual(frame1["white_png_path"] in reviews.namelist(),not local_review)
+                        if local_review:
+                            self.assertEqual(set(reviews.namelist()),{"index.json",*(f["pair_jpeg_path"] for f in version1["frames"])})
+                            self.assertEqual(json.loads(reviews.read("index.json"))["review_storage"],storage)
+                    if local_review:
+                        self.assertEqual(version1["review_storage"],storage)
+                        self.assertNotIn("scene_bundle",artifacts)
+                        retained = data/"work"/first/"1"
+                        self.assertTrue((retained/"out/scene.zip").is_file())
+                        for frame in version1["frames"]:
+                            self.assertTrue((retained/"local-review"/frame["white_png_path"]).is_file())
 
                     status = dict(schema_version=1,job_id="job1",base_version=1,original_annotator_id="alice",
                                   base_manifest_sha256=sha(artifacts["version_manifest"]),
@@ -171,22 +190,32 @@ class WholeMediaSimulation(unittest.TestCase):
                                                 note=note,regions=[dict(x=0.3,y=0.64,w=0.4,h=0.3,note="核对主体位置")])])
                     feedback_artifact = service.store("feedback_manifest",json_blob(feedback),"application/json")
                     approve = self.approval(service,version1,status,all_frames=False)
-                    if variable:
+                    if variable or local_review:
                         node.stop.set()
                         worker.join(timeout=20)
                         self.assertFalse(worker.is_alive())
-                        other = root/"另一台节点"
-                        other.mkdir()
-                        node = Scheduler({**config,"node_key":"fixture-handoff"},other,"fixture",test_http=True)
+                        if local_review:
+                            node = Scheduler(config,data,"fixture",test_http=True)
+                            self.assertEqual(node.instance_id,storage["instance_id"])
+                        else:
+                            other = root/"另一台节点"
+                            other.mkdir()
+                            node = Scheduler({**config,"node_key":"fixture-handoff"},other,"fixture",test_http=True)
                         worker = threading.Thread(target=node.run)
                         worker.start()
+                    references = ("version_manifest","shot_metadata") if local_review else REFERENCES
                     revised = service.schedule("revise",2,artifacts=[*defaults.values(),*timeline,
-                        *service.outputs_from(first,*REFERENCES),feedback_artifact,approve])
+                        *service.outputs_from(first,*references),feedback_artifact,approve],review_storage=storage)
                     self.wait_work(service,node,revised,timeout)
                     self.assertEqual(service.workers["fixture"]!=node.session["worker_id"],variable)
                     self.assertTrue((node.root/"work"/revised/"1/scene/feedback-images/0002.jpg").is_file())
                     new = service.blobs_from(revised)
                     version2 = json.loads(new["version_manifest"])
+                    if local_review:
+                        self.assertNotIn("scene_bundle",new)
+                        self.assertEqual(version2["review_storage"],storage)
+                        with zipfile.ZipFile(io.BytesIO(new["review_bundle"])) as reviews:
+                            self.assertEqual(set(reviews.namelist()),{"index.json",*(f["pair_jpeg_path"] for f in version2["frames"])})
                     changes = [before["number"] for before,after in zip(version1["frames"],version2["frames"],strict=True)
                                if before["review_signature"]!=after["review_signature"]]
                     if model:
@@ -204,7 +233,8 @@ class WholeMediaSimulation(unittest.TestCase):
                     status.update(base_version=2,base_manifest_sha256=sha(new["version_manifest"]))
                     approve = self.approval(service,version2,status,all_frames=True,carried=carried)
                     export = service.schedule("finalize",2,artifacts=[*defaults.values(),*timeline,
-                        *service.outputs_from(revised,*REFERENCES),approve],drop_reply=True,export_quality=export_quality)
+                        *service.outputs_from(revised,*references),approve],drop_reply=True,export_quality=export_quality,
+                        review_storage=storage)
                     self.wait_work(service,node,export,timeout)
                     result = service.blobs_from(export)
                     receipt = service.attempts[export]["body"]["final_verification"]

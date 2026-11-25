@@ -131,6 +131,9 @@ def bundle(args):
         for name in ("README.md", "pyproject.toml", "uv.lock", "install_runtime.py", "contract.openapi.yaml",
                      "启动执行端.cmd", "启动执行端.command"):
             shutil.copy2(ROOT / name, project / name)
+        (project / "docs").mkdir()
+        handoff = Path("docs/服务端同机审片接入.md")
+        shutil.copy2(ROOT / handoff, project / handoff)
         for name in ("release.json", "release.allowed_signers"):
             if (ROOT / name).is_file():
                 shutil.copy2(ROOT / name, project / name)
