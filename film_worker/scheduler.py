@@ -313,8 +313,8 @@ class Scheduler:
             if oss["delivery"] not in {"auto", "manual"} or oss.get("protocol") not in {None, OSS_OBJECTS}:
                 raise ValueError("不支持的 OSS 交付模式")
             if oss.get("protocol") == OSS_OBJECTS:
-                scope = {"prepare": "all_frames", "revise": "rejected_frames", "finalize": None}[order["kind"]]
-                if "review_storage" not in order or oss.get("review_scope") != scope or "review_upload" in order:
+                scopes = {"prepare": {"all_frames"}, "revise": {"rejected_frames", "all_frames"}, "finalize": {None}}
+                if "review_storage" not in order or oss.get("review_scope") not in scopes[order["kind"]] or "review_upload" in order:
                     raise ValueError("OSS 逐图工单的审片范围无效")
         roles = {artifact["role"]: artifact for artifact in order["artifacts"]}
         if roles["source_video"]["size_bytes"] <= 0 or len(roles) != len(order["artifacts"]):
@@ -640,6 +640,16 @@ class Scheduler:
                     raise Interrupted
                 path = self.checkpoint_path(directory, attempt, artifact)
                 if digest(path) != artifact["sha256"]:
+                    return None
+            if assignment["kind"] == "revise":
+                artifacts = checkpoint["outputs"]
+                version = read(self.checkpoint_path(directory, attempt, artifacts["version_manifest"]))
+                frame_numbers = list(range(1, version["frame_count"] + 1))
+                if "review_index" in artifacts:
+                    index = read(self.checkpoint_path(directory, attempt, artifacts["review_index"]))
+                    if [frame["number"] for frame in index["frames"]] != frame_numbers:
+                        return None
+                elif version.get("review_delta") and version["review_delta"]["frames"] != frame_numbers:
                     return None
             return checkpoint
         except (KeyError, OSError, ValueError, TypeError):

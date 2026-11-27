@@ -240,7 +240,6 @@ class Production:
         return result
 
     def create_review(self, source):
-        marked = {}
         if self.previous:
             annotator, approved = self.approval()
             feedback = media.read_json(self.sources["feedback_manifest"])
@@ -298,9 +297,7 @@ class Production:
         (review_root / "pairs").mkdir(parents=True, exist_ok=True)
         (white_root / "white").mkdir(parents=True, exist_ok=True)
         frames = []
-        outside_feedback = []
         prior = {row["number"]: row for row in self.previous["frames"]} if self.previous else {}
-        restricted = bool(self.previous) and (self.incremental or self.object_review)
         for i, pts in enumerate(self.timeline["pts"], 1):
             self.progress("compare_review", i, self.count)
             png = media.frame_path(rendered, i)
@@ -309,12 +306,6 @@ class Production:
             signature = media.signature(pair, self.timeline, i)
             digits = 6 if self.object_review else 4
             jpg_name, png_name = f"pairs/{i:0{digits}d}.jpg", f"white/{i:04d}.png"
-            if restricted and i not in marked:
-                old = prior[i]
-                if old["review_signature"] != signature:
-                    outside_feedback.append(i)
-                jpg_name, png_name = old["pair_jpeg_path"], old["white_png_path"]
-                png = self.prior_white / bundles.safe_path(png_name)
             target = review_root / jpg_name
             if i in prior and prior[i]["review_signature"] == signature:
                 shutil.copyfile(self.prior_review / bundles.safe_path(prior[i]["pair_jpeg_path"]), target)
@@ -324,9 +315,6 @@ class Production:
                 raise ReviewScopeError(f"第 {i} 帧对比图超过服务端 14 MiB 上限")
             shutil.copyfile(png, white_root / png_name)
             frames.append(dict(number=i, pts=pts, review_signature=signature, pair_jpeg_path=jpg_name, white_png_path=png_name))
-        if outside_feedback:
-            sample = "、".join(map(str, outside_feedback[:12]))
-            raise ReviewScopeError(f"返修改动了打回范围外的 {len(outside_feedback)} 帧（{sample}）。请仅调整标注范围，或由审核端补充打回受影响帧")
         common = dict(schema_version=1, job_id=self.order["job_id"], source_sha256=self.timeline["source_sha256"],
                       timeline_sha256=self.timeline_sha, scene_sha256=scene_sha,
                       review_size=dimensions(self.review_size), final_size=dimensions(self.final_size), frames=frames)
@@ -341,22 +329,18 @@ class Production:
         files = bundles.build(review_root, index, review_bundle)
         extra = {}
         if self.incremental:
+            # Previously frozen ZIP work still requires this envelope on the wire.
             delta = dict(mode=REJECTED_FRAMES_MODE, base_version=self.previous["version"],
-                         base_manifest_sha256=digest(self.sources["version_manifest"]), frames=sorted(marked),
+                         base_manifest_sha256=digest(self.sources["version_manifest"]), frames=list(range(1, self.count + 1)),
                          full_files_sha256=object_hash(sorted(files, key=lambda row: row["path"])))
-            changed = {frames[n-1]["pair_jpeg_path"] for n in marked}
-            if not self.review_storage:
-                changed.update(frames[n-1]["white_png_path"] for n in marked)
             review_bundle = self.output / "review-delta.zip"
-            bundles.build(review_root, dict(index, review_delta=delta), review_bundle,
-                          content=[row for row in files if row["path"] in changed])
+            bundles.build(review_root, dict(index, review_delta=delta), review_bundle)
             extra["review_delta"] = delta
         if self.object_review:
             review_index = self.output / "review-index.json"
             entries = {row["path"]: row for row in files}
-            selected = sorted(marked) if self.previous else range(1, self.count + 1)
             image_rows = [dict(number=n, **{name: entries[frames[n-1]["pair_jpeg_path"]][name]
-                                            for name in ("size_bytes", "sha256")}) for n in selected]
+                                            for name in ("size_bytes", "sha256")}) for n in range(1, self.count + 1)]
             keys = ("job_id", "source_sha256", "timeline_sha256", "review_storage", "review_media")
             media.write_json(review_index, {**{k: common[k] for k in keys}, "version": self.order["target_version"],
                             "input_manifest_sha256": expected, "frames": image_rows,
@@ -436,10 +420,9 @@ class Production:
 先读 feedback-summary.json，再按需要检查 feedback.json 原文、圈选图及连续源帧。按帧号核对受影响的动作范围和相邻帧，修改 scene.blend 及需要更新的 meta.jsonl。
 圈选坐标相对于整张上下对比图，上方原片、下方白模。补建网格使用包内 production_palette.apply_palette 并保留原来的人体几何及其配色属性。
 """
-        if self.kind == "revise" and (self.incremental or self.object_review):
-            phase += ("本轮服务端只接收反馈清单里的打回帧。实改画面必须限制在这些帧，核对关键帧插值、镜头、"
-                      "材质、灯光及曝光对相邻帧的影响，确保反馈范围外的画面与基版一致。"
-                      "整镜确实需要改动时，在制作记录写清受影响帧，交由人工扩大打回范围。\n")
+        if self.kind == "revise":
+            phase += ("按返修意见与其影响范围修改，复查关键帧插值、镜头、材质、灯光及曝光。"
+                      "保留无关画面，记录连带变化的帧段，全片送审。\n")
         technical = (f"\n工程核验失败，工作台要求做一次技术修复。实际错误：{repair}\n"
                      "仅修复此问题及直接受影响的文件。首制修改后重新编译、编码和检查。") if repair else ""
         return f"""原片 {source}。编号源帧 {self.frames}。本轮只写入 {self.stage}。

@@ -81,7 +81,7 @@ paths:
         in: header
         schema:
           const: rejected_frames_v1
-        description: 支持 ZIP 增量返修。由服务端用冻结入参 review_upload 启用。
+        description: 支持 ZIP 返修兼容封装。服务端通过冻结入参 review_upload 启用。执行端使用该封装提交全帧。
       requestBody:
         required: true
         content:
@@ -1504,7 +1504,7 @@ components:
           $ref: '#/components/schemas/LocalReviewStorage'
         review_upload:
           const: rejected_frames_v1
-          description: 仅 ZIP 返修工单会下发。使用 feedback_manifest.frames 冻结本轮上传范围。
+          description: 仅 ZIP 返修工单会下发。review_delta 帧列表须包含 feedback_manifest.frames 中的打回帧，允许提交全帧。
         artifacts:
           type: array
           items:
@@ -2347,7 +2347,7 @@ components:
           description: 省略时沿用 OSS 整包 ZIP。
         review_scope:
           enum: [all_frames, rejected_frames, null]
-          description: 从首版至出片分别为 all_frames、rejected_frames、null。
+          description: 首版为 all_frames，出片为 null。返修兼容 rejected_frames 与 all_frames，均提交全帧。
     OSSManifestBinding:
       type: object
       required: [input_manifest_sha256]
@@ -2397,7 +2397,7 @@ components:
           maxItems: 2400
           items:
             $ref: '#/components/schemas/OSSImage'
-      description: 首版包含全部帧。返修仅包含打回帧，完整帧记录见 version.json。
+      description: 执行端首版和返修均提交完整帧列表。服务端兼容历史上仅包含部分帧的返修清单。
     OSSSubmission:
       type: object
       additionalProperties: false
@@ -2491,7 +2491,7 @@ components:
       description: >-
         ZIP 根目录含 index.json。files 逐一索引 ZIP 内的其他文件。集中存储时包含上下对比 JPEG 和白模 PNG。
         同机模式只含 pairs/*.jpg，各帧的 white_png_path 指向执行端本机文件，服务端无需读取。
-        增量 ZIP 的 files 仅索引打回帧文件，frames 仍是完整列表。管理端与基版合并后再验证文件与帧覆盖。
+        ZIP 兼容封装的 files 索引 review_delta.frames 对应的文件。执行端提交全帧，frames 始终为完整版本列表。
       allOf:
       - if:
           required: [review_storage]
