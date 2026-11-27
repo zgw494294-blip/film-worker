@@ -16,6 +16,9 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 REVIEW_STORAGE_HEADER = "X-Film-Worker-Review-Storage"
 STORAGE_HEARTBEAT_HEADER = "X-Film-Worker-Storage"
 LOCAL_REVIEW_MODE = "node_local_v1"
+REVIEW_UPLOAD_HEADER = "X-Film-Worker-Review-Upload"
+REJECTED_FRAMES_MODE = "rejected_frames_v1"
+OSS_OBJECTS = "objects_v1"
 
 
 class ProtocolError(Exception):
@@ -70,6 +73,8 @@ class Client:
         if not self.base.endswith("/api/v1"):
             self.base += "/api/v1"
         self.token = token
+        self.test_http = test_http
+        self.objects = build_opener(NoRedirects())
         handlers = [NoRedirects()]
         if server_ca_file:
             try:
@@ -80,7 +85,7 @@ class Client:
             handlers.append(HTTPSHandler(context=context))
         self.opener = build_opener(*handlers)
 
-    def open(self, method, path, *, body=None, headers=None, timeout=12):
+    def open(self, method, path, *, body=None, headers=None, timeout=12, accept_redirect=False):
         request_headers = {"Authorization": "Bearer " + self.token, **(headers or {})}
         if body is not None and not isinstance(body, bytes):
             body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
@@ -89,6 +94,8 @@ class Client:
         try:
             return self.opener.open(request, timeout=timeout)
         except HTTPError as response:
+            if accept_redirect and response.code == 302:
+                return response
             with response:
                 retry_after = response.headers.get("Retry-After", "")
                 try:
@@ -115,6 +122,24 @@ class Client:
                                     detail="请核对 HTTPS 地址与证书名称，并配置受信任的服务端 PEM 证书") from None
             raise ProtocolError(0, "network_unavailable", True) from None
 
+    def open_object(self, url, position):
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        local = self.test_http and host in {"localhost", "127.0.0.1", "::1"}
+        aliyun = (parsed.scheme == "https" and parsed.port in (None, 443)
+                  and re.fullmatch(r"[a-z0-9-]+\.oss-cn-[a-z0-9-]+\.aliyuncs\.com", host))
+        if (parsed.username or parsed.password or parsed.fragment
+                or not (aliyun or (local and parsed.scheme in {"https", "http"}))):
+            raise ValueError("服务端返回的 OSS 下载地址无效")
+        headers = {"Range": f"bytes={position}-"} if position else {}
+        try:
+            return self.objects.open(Request(url, headers=headers), timeout=20)
+        except HTTPError as exc:
+            with exc:
+                raise ProtocolError(exc.code, "oss_download_rejected", exc.code in {408, 429, 500, 502, 503, 504}) from None
+        except (URLError, socket.timeout, ConnectionError, http.client.HTTPException):
+            raise ProtocolError(0, "oss_download_unavailable", True) from None
+
     def json(self, method, path, *, body=None, headers=None, timeout=12, response_headers=None):
         try:
             with self.open(method, path, body=body, headers=headers, timeout=timeout) as response:
@@ -132,6 +157,7 @@ class Transfer:
     def __init__(self, client, assignment, stop, cache):
         self.api = client
         self.work = opaque(assignment["work_id"])
+        self.source_url = (assignment.get("oss") or {}).get("source_url")
         lease = assignment["lease"]
         self.headers = {"X-Lease-Id": opaque(lease["lease_id"]), "X-Fence": str(lease["fence"]),
                         "X-Attempt": str(lease["attempt"])}
@@ -170,6 +196,24 @@ class Transfer:
         path = f"/artifacts/{opaque(artifact['artifact_id'])}/content?work_id={self.work}"
         etag = f'"{expected}"'
 
+        def open_download(position):
+            if artifact.get("role") == "source_video" and self.source_url:
+                try:
+                    return self.api.open_object(self.source_url, position), True
+                except ProtocolError as exc:
+                    if exc.status not in {400, 401, 403, 404}:
+                        raise
+                    self.source_url = None
+            headers = dict(self.headers)
+            if position:
+                headers.update(Range=f"bytes={position}-", **{"If-Range": etag})
+            response = self.api.open("GET", path, headers=headers, accept_redirect=True)
+            if response.status != 302:
+                return response, False
+            with response:
+                location = response.headers.get("Location", "")
+            return self.api.open_object(location, position), True
+
         def transfer():
             if target.is_file() and target.stat().st_size == size and digest(target) == expected:
                 return target
@@ -180,11 +224,9 @@ class Transfer:
             if position >= size:
                 partial.unlink(missing_ok=True)
                 position = 0
-            headers = dict(self.headers)
-            if position:
-                headers.update(Range=f"bytes={position}-", **{"If-Range": etag})
-            with self.api.open("GET", path, headers=headers) as response:
-                if response.headers.get("ETag") != etag:
+            response, external = open_download(position)
+            with response:
+                if not external and response.headers.get("ETag") != etag:
                     raise ValueError("下载对象 ETag 与冻结清单不符")
                 if response.status == 206:
                     if response.headers.get("Content-Range") != f"bytes {position}-{size-1}/{size}":

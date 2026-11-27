@@ -21,6 +21,10 @@
 <label>建模 Token<input name="token" type="password" placeholder="留空沿用已保存的 Token" autocomplete="new-password"></label>
 <label>服务端证书路径<input name="server_ca_file" placeholder="使用内网自签证书时填写本机 PEM 路径"></label>
 </div></fieldset>
+<details><summary>OSS 自动交付</summary><div class="grid">
+<label>AccessKey ID<input name="oss_key_id" autocomplete="off" placeholder="留空沿用已保存的凭据"></label>
+<label>AccessKey Secret<input name="oss_key_secret" type="password" autocomplete="new-password"></label>
+</div></details>
 <fieldset><legend>并发和渲染</legend><div class="grid">
 <label>总工单<input name="slots" type="number" min="1" max="128" required></label>
 <label>Codex 进程<input name="model_slots" type="number" min="1" max="128" required></label>

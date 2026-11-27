@@ -1,5 +1,6 @@
 """Node token in the macOS Keychain or Windows Credential Manager."""
 import hashlib
+import json
 import os
 import subprocess
 
@@ -12,7 +13,10 @@ def read_token(root):
     inherited = os.environ.get("FILM_WORKER_TOKEN")
     if inherited:
         return inherited
-    target = label(root)
+    return read_stored(label(root))
+
+
+def read_stored(target):
     if os.name == "nt":
         import win32cred
         from pywintypes import error
@@ -31,23 +35,48 @@ def read_token(root):
 def store_token(root, token):
     if not token.isascii() or not 1 <= len(token) <= 1024 or any(char.isspace() for char in token):
         raise ValueError("建模 Token 格式错误")
-    target = label(root)
+    store_secret(label(root), token)
+
+
+OSS_ENV = ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET", "OSS_SESSION_TOKEN")
+
+
+def oss_credentials(root):
+    access_id, secret, session = (os.environ.get(name, "") for name in OSS_ENV)
+    if access_id or secret or session:
+        if not access_id or not secret:
+            raise ValueError("请同时提供 OSS AccessKey ID 和 Secret")
+        return access_id, secret, session or None
+    stored = read_stored(label(root) + "/oss")
+    if not stored:
+        raise ValueError("此工单需要 OSS 自动交付，请先在执行端保存 OSS AccessKey")
+    return (*json.loads(stored), None)
+
+
+def store_oss_credentials(root, access_id, secret):
+    if any(not isinstance(value, str) or not value.isascii() or not 1 <= len(value) <= 256
+           or any(not 33 <= ord(char) <= 126 for char in value) for value in (access_id, secret)):
+        raise ValueError("请同时填写有效的 OSS AccessKey ID 和 Secret")
+    store_secret(label(root) + "/oss", json.dumps([access_id, secret], separators=(",", ":")))
+
+
+def store_secret(target, value):
     if os.name == "nt":
         import win32cred
         from pywintypes import error
         try:
             win32cred.CredWrite(dict(Type=win32cred.CRED_TYPE_GENERIC, TargetName=target,
                                     Persist=win32cred.CRED_PERSIST_LOCAL_MACHINE,
-                                    CredentialBlob=token), 0)
+                                    CredentialBlob=value), 0)
         except error as exc:
             raise windows_credential_error(exc, "保存") from exc
     else:
         # Feed security's command interpreter via stdin so the token stays out of process arguments.
         import shlex
-        line = 'add-generic-password -U -s ' + target + ' -a worker -w ' + shlex.quote(token)
+        line = 'add-generic-password -U -s ' + target + ' -a worker -w ' + shlex.quote(value)
         result = subprocess.run(["/usr/bin/security", "-i"], input=line+"\n", capture_output=True,
                                 text=True, check=False)
-        if result.returncode != 0 or read_token(root) != token:
+        if result.returncode != 0 or read_stored(target) != value:
             raise ValueError("macOS 钥匙串保存失败")
 
 

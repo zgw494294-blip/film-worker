@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -77,6 +78,25 @@ def get_python(target_id, cache, provided_path):
     return (store / exact).resolve(strict=True)
 
 
+def wheel_preference(name, target):
+    _, python, abi, platform = name.removesuffix(".whl").rsplit("-", 3)
+    if abi == "none" and platform == "any" and "py3" in python.split("."):
+        return 1, 0
+    match = re.fullmatch(r"cp3(\d+)", python)
+    if match is None or not (abi == "abi3" and int(match[1]) <= 12 or python == abi == "cp312"):
+        return None
+    score = 3 if abi == "cp312" else 2
+    if target.startswith("windows"):
+        return (score, 1) if platform == "win_amd64" else None
+    arch = target.removeprefix("macos-")
+    eligible = []
+    for tag in platform.split("."):
+        mac = re.fullmatch(r"macosx_(\d+)_(\d+)_(arm64|x86_64|universal2)", tag)
+        if mac and mac[3] in (arch, "universal2") and tuple(map(int, mac.groups()[:2])) <= (14, 0):
+            eligible.append(int(mac[3] == arch))
+    return (score, max(eligible)) if eligible else None
+
+
 def package_wheels(runtimes, target, cache):
     lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     wheeldir = runtimes / "wheels"
@@ -86,20 +106,15 @@ def package_wheels(runtimes, target, cache):
     for package in lock["package"]:
         if package["name"] == "film-worker" or (package["name"] == "pywin32" and not target.startswith("windows")):
             continue
-        def suitable(file):
+        ranked = []
+        for file in package["wheels"]:
             name = PurePosixPath(urlsplit(file["url"]).path).name
-            if name.endswith("-py3-none-any.whl"):
-                return True
-            if "-cp312-" not in name:
-                return False
-            if target.startswith("windows"):
-                return name.endswith("-win_amd64.whl")
-            return "-macosx_" in name and name.endswith("_" + target.removeprefix("macos-") + ".whl")
-
-        options = [file for file in package["wheels"] if suitable(file)]
-        if len(options) != 1:
-            raise ValueError(f"{target} 没有唯一可分发的 wheel {package['name']}")
-        artifact = options[0]
+            score = wheel_preference(name, target)
+            if score:
+                ranked.append((score, name, file))
+        if not ranked:
+            raise ValueError(f"{target} 没有可分发的 wheel {package['name']}")
+        artifact = max(ranked, key=lambda item: (item[0], item[1]))[2]
         hexdigest = artifact["hash"].split(":", 1)[1]
         path = fetch(artifact["url"], hexdigest, cache)
         shutil.copyfile(path, wheeldir / path.name)

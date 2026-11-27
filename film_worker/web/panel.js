@@ -20,7 +20,8 @@ async function api(path, body) {
 }
 
 const stateNames = {connected: "服务已连接", stopped: "未运行", connecting: "正在连接", network_unavailable: "网络不可用", configuration_error: "配置需处理", tls_verification_failed: "服务端证书验证失败", invalid_token: "建模 Token 无效", forbidden: "设备信息不匹配", instance_bound: "设备绑定到其他实例", instance_busy: "设备正在被其他实例使用"};
-const stages = {download: "正在下载输入", codex_author: "Codex 制作", prepare_source: "抽取原片帧", compare_review: "生成对比图", verify_review: "核对审核签名"};
+const stages = {download: "正在下载输入", codex_author: "Codex 制作", prepare_source: "抽取原片帧", compare_review: "生成对比图", verify_review: "核对审核签名", upload_oss: "正在上传 OSS"};
+const workStates = {verifying: "服务端正在校验", awaiting_manual: "待手动交付"};
 
 async function refresh() {
   try {
@@ -56,7 +57,8 @@ async function refresh() {
     const recent = (state.history ?? []).map(item => {
       const line = document.createElement("li");
       const transfer = item.delivery_versions.length ? ` · 已交付版 ${item.delivery_versions.join("、")}` : "";
-      line.textContent = `${item.job_id} · ${item.kind} · ${item.job_state ?? item.status}${transfer}` +
+      const status = workStates[item.status] ?? item.job_state ?? item.status;
+      line.textContent = `${item.job_id} · ${item.kind} · ${status}${transfer}` +
         (item.message ? ` · ${item.message}` : "");
       return line;
     });
@@ -87,12 +89,15 @@ form.addEventListener("submit", async event => {
   event.preventDefault();
   try {
     const config = Object.fromEntries(new FormData(form));
-    const token = config.token;
-    delete config.token;
+    const credentials = {};
+    for (const key of ["token","oss_key_id","oss_key_secret"]) {
+      credentials[key] = config[key];
+      delete config[key];
+    }
     config.auto_update = form.elements.namedItem("auto_update").checked;
     for (const field of form.querySelectorAll("input[type=number]")) config[field.name] = Number(field.value);
-    await api("config", {config, token});
-    form.elements.namedItem("token").value = "";
+    await api("config", {config, ...credentials});
+    for (const key of Object.keys(credentials)) form.elements.namedItem(key).value = "";
     document.querySelector("#address").textContent = config.server || "本机控制面板";
     message("配置已保存");
   } catch (error) {

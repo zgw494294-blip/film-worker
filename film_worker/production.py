@@ -18,8 +18,8 @@ from .actor_guard import ACTOR_GEOMETRY
 from .engineering_checks import EngineeringValidationError
 from .production_helpers import check_rendered_frames, validate_meta, write_feedback
 from .production_palette import prompt_table
-from .protocol import digest
-from .settings import atomic_json
+from .protocol import OSS_OBJECTS, REJECTED_FRAMES_MODE, digest
+from .settings import atomic_json, object_hash
 from .state import slot
 
 HERE = Path(__file__).resolve().parent
@@ -27,6 +27,10 @@ BODY_MODEL = HERE / "assets/基础模型.blend"
 SKILL = HERE / "skills/movie-shot-workflow"
 VIDEO_SUFFIXES = {"video/mp4": ".mp4", "video/quicktime": ".mov", "video/x-matroska": ".mkv",
                   "video/webm": ".webm", "video/x-msvideo": ".avi"}
+
+
+class ReviewScopeError(ValueError):
+    """A rendered change cannot be published within the frozen feedback range."""
 
 
 def size(value):
@@ -63,6 +67,9 @@ class Production:
         self.order = request["assignment"]["input_manifest"]
         self.kind = self.order["kind"]
         self.review_storage = self.order.get("review_storage")
+        self.oss = request["assignment"].get("oss") or {}
+        self.object_review = self.oss.get("protocol") == OSS_OBJECTS
+        self.incremental = self.order.get("review_upload") == REJECTED_FRAMES_MODE
         self.profile = request.get("production") or self.order.get("profile") or {}
         self.env = request["environment"].copy()
         self.tools = request["tools"]
@@ -133,6 +140,8 @@ class Production:
         timeline = media.prepare_source(self.root, source, width)
         self.timeline = timeline
         self.count = len(timeline["pts"])
+        if self.kind != "finalize" and self.count > 2400:
+            raise ReviewScopeError(f"原片有 {self.count} 帧，超过服务端单作业 2400 帧上限")
         self.final_size = timeline["width"], timeline["height"]
         self.review_size = review_dimensions(timeline, self.profile)
         self.frames = self.root / "intake/frames"
@@ -165,6 +174,8 @@ class Production:
             raise ValueError("正式出片缺少已审核的人工作品来源")
         if base.get("review_storage") != self.review_storage:
             raise ValueError("基版审片存储模式或绑定实例不符")
+        if base.get("review_media") != (OSS_OBJECTS if self.object_review else None):
+            raise ValueError("基版审片介质与工单不符")
         self.previous = base
         self.review_size = size(base["review_size"])
         if size(base["final_size"]) != self.final_size:
@@ -178,14 +189,20 @@ class Production:
         scene = bundles.extract(self.sources["scene_bundle"], self.prior_scene, indexed=True)
         review = bundles.extract(self.sources["review_bundle"], self.prior_review, indexed=True)
         self.scene_file = self.prior_scene / "scene.blend"
-        if (digest(self.scene_file), scene["scene_sha256"], review["scene_sha256"],
-                digest(self.sources["scene_bundle"]), digest(self.sources["review_bundle"]),
+        if (digest(self.scene_file), scene["scene_sha256"], review["scene_sha256"], digest(self.sources["scene_bundle"]),
                 digest(self.sources["shot_metadata"])) != (
                 base["scene_sha256"], base["scene_sha256"], base["scene_sha256"], base["scene_bundle_sha256"],
-                base["review_bundle_sha256"], base["shot_metadata_sha256"]):
+                base["shot_metadata_sha256"]):
             raise ValueError("基版工程或审片文件已变更")
+        delta = base.get("review_delta")
+        if delta:
+            if "review_delta" in review or object_hash(sorted(review["files"], key=lambda row: row["path"])) != delta["full_files_sha256"]:
+                raise ValueError("基版全量审片包与增量清单不符")
+        elif digest(self.sources["review_bundle"]) != base["review_bundle_sha256"]:
+            raise ValueError("基版审片包摘要不符")
         if any(review.get(k) != base.get(k) for k in (
-                "job_id", "source_sha256", "timeline_sha256", "review_size", "final_size", "frames", "review_storage")):
+                "job_id", "source_sha256", "timeline_sha256", "review_size", "final_size", "frames", "review_storage",
+                "review_media")):
             raise ValueError("基版审核索引不匹配")
         if [f["number"] for f in base["frames"]] != list(range(1, self.count + 1)):
             raise ValueError("审核帧索引不连续")
@@ -223,6 +240,7 @@ class Production:
         return result
 
     def create_review(self, source):
+        marked = {}
         if self.previous:
             annotator, approved = self.approval()
             feedback = media.read_json(self.sources["feedback_manifest"])
@@ -280,21 +298,35 @@ class Production:
         (review_root / "pairs").mkdir(parents=True, exist_ok=True)
         (white_root / "white").mkdir(parents=True, exist_ok=True)
         frames = []
+        outside_feedback = []
         prior = {row["number"]: row for row in self.previous["frames"]} if self.previous else {}
+        restricted = bool(self.previous) and (self.incremental or self.object_review)
         for i, pts in enumerate(self.timeline["pts"], 1):
             self.progress("compare_review", i, self.count)
             png = media.frame_path(rendered, i)
             white = media.rgb(png)
             pair = media.comparison(self.frames, white, i)
             signature = media.signature(pair, self.timeline, i)
-            jpg_name, png_name = f"pairs/{i:04d}.jpg", f"white/{i:04d}.png"
+            digits = 6 if self.object_review else 4
+            jpg_name, png_name = f"pairs/{i:0{digits}d}.jpg", f"white/{i:04d}.png"
+            if restricted and i not in marked:
+                old = prior[i]
+                if old["review_signature"] != signature:
+                    outside_feedback.append(i)
+                jpg_name, png_name = old["pair_jpeg_path"], old["white_png_path"]
+                png = self.prior_white / bundles.safe_path(png_name)
             target = review_root / jpg_name
             if i in prior and prior[i]["review_signature"] == signature:
                 shutil.copyfile(self.prior_review / bundles.safe_path(prior[i]["pair_jpeg_path"]), target)
             else:
                 pair.save(target, quality=94, subsampling=0)
+            if target.stat().st_size > 14 * 1024**2:
+                raise ReviewScopeError(f"第 {i} 帧对比图超过服务端 14 MiB 上限")
             shutil.copyfile(png, white_root / png_name)
             frames.append(dict(number=i, pts=pts, review_signature=signature, pair_jpeg_path=jpg_name, white_png_path=png_name))
+        if outside_feedback:
+            sample = "、".join(map(str, outside_feedback[:12]))
+            raise ReviewScopeError(f"返修改动了打回范围外的 {len(outside_feedback)} 帧（{sample}）。请仅调整标注范围，或由审核端补充打回受影响帧")
         common = dict(schema_version=1, job_id=self.order["job_id"], source_sha256=self.timeline["source_sha256"],
                       timeline_sha256=self.timeline_sha, scene_sha256=scene_sha,
                       review_size=dimensions(self.review_size), final_size=dimensions(self.final_size), frames=frames)
@@ -302,8 +334,34 @@ class Production:
             common["profile_hash"] = self.profile["profile_hash"]
         if self.review_storage:
             common["review_storage"] = self.review_storage
+        if self.object_review:
+            common["review_media"] = OSS_OBJECTS
         review_bundle = self.output / "review.zip"
-        bundles.build(review_root, dict(common, target_version=self.order["target_version"]), review_bundle)
+        index = dict(common, target_version=self.order["target_version"])
+        files = bundles.build(review_root, index, review_bundle)
+        extra = {}
+        if self.incremental:
+            delta = dict(mode=REJECTED_FRAMES_MODE, base_version=self.previous["version"],
+                         base_manifest_sha256=digest(self.sources["version_manifest"]), frames=sorted(marked),
+                         full_files_sha256=object_hash(sorted(files, key=lambda row: row["path"])))
+            changed = {frames[n-1]["pair_jpeg_path"] for n in marked}
+            if not self.review_storage:
+                changed.update(frames[n-1]["white_png_path"] for n in marked)
+            review_bundle = self.output / "review-delta.zip"
+            bundles.build(review_root, dict(index, review_delta=delta), review_bundle,
+                          content=[row for row in files if row["path"] in changed])
+            extra["review_delta"] = delta
+        if self.object_review:
+            review_index = self.output / "review-index.json"
+            entries = {row["path"]: row for row in files}
+            selected = sorted(marked) if self.previous else range(1, self.count + 1)
+            image_rows = [dict(number=n, **{name: entries[frames[n-1]["pair_jpeg_path"]][name]
+                                            for name in ("size_bytes", "sha256")}) for n in selected]
+            keys = ("job_id", "source_sha256", "timeline_sha256", "review_storage", "review_media")
+            media.write_json(review_index, {**{k: common[k] for k in keys}, "version": self.order["target_version"],
+                            "input_manifest_sha256": expected, "frames": image_rows,
+                            "base_manifest_sha256": digest(self.sources["version_manifest"]) if self.previous else None})
+            extra["review_index_sha256"] = digest(review_index)
         report = self.output / "production.json"
         records = self.stage / "制作记录.md"
         details = records.read_text(encoding="utf-8")[:30000] if records.is_file() else ""
@@ -313,11 +371,14 @@ class Production:
                                         production_method="codex_trial", scene_bundle_sha256=digest(scene_bundle), review_bundle_sha256=digest(review_bundle),
                                         shot_metadata_sha256=digest(metadata), production_report_sha256=digest(report),
                                         input_manifest_sha256=self.request["assignment"]["input_manifest_sha256"],
-                                        environment=self.env))
+                                        environment=self.env, **extra))
         outputs = dict(scene_bundle=scene_bundle, shot_metadata=metadata, review_bundle=review_bundle,
                        version_manifest=manifest, production_report=report)
         if self.review_storage:
             del outputs["scene_bundle"]
+        if self.object_review:
+            del outputs["review_bundle"]
+            outputs["review_index"] = review_index
         if self.kind == "prepare":
             outputs["source_timeline"] = self.timeline_file
         return dict(outputs={k: str(v) for k,v in outputs.items()}, environment=self.env)
@@ -375,6 +436,10 @@ class Production:
 先读 feedback-summary.json，再按需要检查 feedback.json 原文、圈选图及连续源帧。按帧号核对受影响的动作范围和相邻帧，修改 scene.blend 及需要更新的 meta.jsonl。
 圈选坐标相对于整张上下对比图，上方原片、下方白模。补建网格使用包内 production_palette.apply_palette 并保留原来的人体几何及其配色属性。
 """
+        if self.kind == "revise" and (self.incremental or self.object_review):
+            phase += ("本轮服务端只接收反馈清单里的打回帧。实改画面必须限制在这些帧，核对关键帧插值、镜头、"
+                      "材质、灯光及曝光对相邻帧的影响，确保反馈范围外的画面与基版一致。"
+                      "整镜确实需要改动时，在制作记录写清受影响帧，交由人工扩大打回范围。\n")
         technical = (f"\n工程核验失败，工作台要求做一次技术修复。实际错误：{repair}\n"
                      "仅修复此问题及直接受影响的文件。首制修改后重新编译、编码和检查。") if repair else ""
         return f"""原片 {source}。编号源帧 {self.frames}。本轮只写入 {self.stage}。
@@ -526,8 +591,6 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
                      version_manifest_sha256=digest(self.sources["version_manifest"]),
                      approval_manifest_sha256=digest(self.sources["approval_manifest"]),
                      timeline_sha256=self.timeline_sha, final_size=dimensions(output_size))
-        archive = self.output / "delivery.zip"
-        bundles.build(delivery, index, archive)
         self.env.update({k: self.previous["environment"].get(k) for k in ("codex_model","codex_provider","reasoning_effort")},
                         model_evidence="inherited")
         verification = {k: index[k] for k in ("version_manifest_sha256", "approval_manifest_sha256", "timeline_sha256")}
@@ -535,8 +598,16 @@ Blender 启动只能用后台前缀 {quote(self.blender_command())}，追加 -b 
                             white_frame_count=self.count, comparison_frame_count=self.count, pts_verified=True,
                             audio_verified=True, white_size=dimensions(output_size), comparison_size=dimensions(compare_size),
                             render_source="approved_native_white" if approved_native else "locked_scene_native_render")
-        return dict(environment=self.env, final_verification=verification,
-                    outputs=dict(white_video=str(white_path), comparison_video=str(compare_path), delivery_bundle=str(archive)))
+        if self.object_review and self.oss["delivery"] == "manual":
+            media.write_json(delivery / "delivery-proof.json",
+                             dict(input_manifest_sha256=self.request["assignment"]["input_manifest_sha256"],
+                                  final_verification=verification))
+        archive = self.output / "delivery.zip"
+        bundles.build(delivery, index, archive)
+        outputs = dict(delivery_bundle=str(archive))
+        if not self.object_review:
+            outputs.update(white_video=str(white_path), comparison_video=str(compare_path))
+        return dict(environment=self.env, final_verification=verification, outputs=outputs)
 
 
 def run_child(root):
@@ -559,7 +630,7 @@ def run_child(root):
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         atomic_json(root / "error.json", {"code": "input_invalid" if isinstance(exc, ValueError) else "render_failed",
-                                         "message": type(exc).__name__})
+                                         "message": str(exc) if isinstance(exc, ReviewScopeError) else type(exc).__name__})
         return 1
     atomic_json(root / "result.json", result)
     return 0

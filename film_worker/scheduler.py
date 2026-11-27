@@ -12,10 +12,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import bundles
+from . import bundles, oss_delivery
 from .processes import ProcessTree
-from .protocol import (LOCAL_REVIEW_MODE, REVIEW_STORAGE_HEADER, STORAGE_HEARTBEAT_HEADER, Client, Interrupted, ProtocolError,
-                       Transfer, digest, key, opaque, valid_digest)
+from .protocol import (LOCAL_REVIEW_MODE, OSS_OBJECTS, REJECTED_FRAMES_MODE, REVIEW_STORAGE_HEADER, REVIEW_UPLOAD_HEADER,
+                       STORAGE_HEARTBEAT_HEADER, Client, Interrupted, ProtocolError, Transfer, digest, key, opaque, valid_digest)
+from .secrets import OSS_ENV, oss_credentials
 from .settings import (KINDS, ROOT, atomic_json, environment, inspect_tools, object_hash,
                        production_settings, registration, resolve_tools, validate_config)
 from .state import State, identity, slot
@@ -25,6 +26,7 @@ ROLE_TYPES = {
     "scene_bundle": "application/zip", "review_bundle": "application/zip", "version_manifest": "application/json",
     "source_timeline": "application/json", "production_report": "application/json", "shot_metadata": "application/x-ndjson",
     "delivery_bundle": "application/zip", "white_video": "video/mp4", "comparison_video": "video/mp4",
+    "review_index": "application/json",
 }
 
 OUTPUT_ROLES = {
@@ -32,6 +34,7 @@ OUTPUT_ROLES = {
     "revise": {"scene_bundle", "shot_metadata", "review_bundle", "version_manifest", "production_report"},
     "finalize": {"white_video", "comparison_video", "delivery_bundle"},
 }
+OSS_WAITING = {"awaiting_manual", "verifying"}
 
 
 def read(path):
@@ -40,6 +43,10 @@ def read(path):
 
 def output_roles(assignment):
     roles = OUTPUT_ROLES[assignment["kind"]]
+    if (assignment.get("oss") or {}).get("protocol") == OSS_OBJECTS:
+        if assignment["kind"] == "finalize":
+            return {"delivery_bundle"}
+        return (roles - {"scene_bundle", "review_bundle"}) | {"review_index"}
     return roles - {"scene_bundle"} if "review_storage" in assignment["input_manifest"] else roles
 
 
@@ -209,7 +216,8 @@ class Scheduler:
                         register_key = register_key or str(uuid.uuid4())
                         self.session, _ = self.api.json("POST", "/workers/register", body=payload,
                                                          headers={"Idempotency-Key": register_key,
-                                                                  REVIEW_STORAGE_HEADER: LOCAL_REVIEW_MODE},
+                                                                  REVIEW_STORAGE_HEADER: LOCAL_REVIEW_MODE,
+                                                                  REVIEW_UPLOAD_HEADER: REJECTED_FRAMES_MODE},
                                                          response_headers=response_headers)
                         register_key = None
                         self.storage_heartbeat = response_headers.get(STORAGE_HEARTBEAT_HEADER.lower()) == "1"
@@ -234,7 +242,7 @@ class Scheduler:
                     if now >= next_reconcile:
                         self.recover()
                         self.reconcile()
-                        next_reconcile = time.monotonic() + 60
+                        next_reconcile = time.monotonic() + 15
                     with self.lock:
                         free = self.cfg["slots"] - len(self.active)
                     if accept and enough and free > 0 and now >= next_poll and not (
@@ -298,6 +306,16 @@ class Scheduler:
             raise ValueError("工单和输入清单的标识不一致")
         if object_hash(order) != assignment["input_manifest_sha256"]:
             raise ValueError("输入清单摘要不匹配")
+        if "review_upload" in order and (order["review_upload"] != REJECTED_FRAMES_MODE or order["kind"] != "revise"):
+            raise ValueError("工单的增量审片模式无效")
+        oss = assignment.get("oss")
+        if oss is not None:
+            if oss["delivery"] not in {"auto", "manual"} or oss.get("protocol") not in {None, OSS_OBJECTS}:
+                raise ValueError("不支持的 OSS 交付模式")
+            if oss.get("protocol") == OSS_OBJECTS:
+                scope = {"prepare": "all_frames", "revise": "rejected_frames", "finalize": None}[order["kind"]]
+                if "review_storage" not in order or oss.get("review_scope") != scope or "review_upload" in order:
+                    raise ValueError("OSS 逐图工单的审片范围无效")
         roles = {artifact["role"]: artifact for artifact in order["artifacts"]}
         if roles["source_video"]["size_bytes"] <= 0 or len(roles) != len(order["artifacts"]):
             raise ValueError("工单包含空原片或重复的工件角色")
@@ -358,6 +376,24 @@ class Scheduler:
     def work_status(self, assignment):
         return self.api.json("GET", f"/jobs/{opaque(assignment['job_id'])}/status?work_id={opaque(assignment['work_id'])}")[0]
 
+    def record_oss_state(self, assignment, status, *, message=None):
+        if status == "awaiting_manual":
+            work, attempt = identity(assignment)
+            directory = self.root / "work" / opaque(work) / str(attempt)
+            path = str(oss_delivery.manual_archive(assignment, directory))
+            message = " · ".join(filter(None, (message, "手动交付文件", path)))
+        self.state.mark(assignment, status=status, message=message)
+
+    def observe_oss_state(self, assignment, response):
+        if not assignment.get("oss") or response["attempt"] != assignment["lease"]["attempt"]:
+            return False
+        status = response["work_state"]
+        if status not in OSS_WAITING | {"failed", "paused", "stopped", "deleted"}:
+            return False
+        detail = response.get("failure_message") or response.get("failure")
+        self.record_oss_state(assignment, status, message=detail)
+        return True
+
     def recover(self):
         with self.lock:
             active = set(self.active)
@@ -375,6 +411,8 @@ class Scheduler:
                 continue
             if current.get("receipt") and current["receipt"]["attempt"] == row["number"]:
                 self.state.mark(assignment, status="succeeded", receipt=current["receipt"])
+            elif self.observe_oss_state(assignment, current):
+                continue
             elif current["work_state"] == "leased" and current["attempt"] == row["number"]:
                 if free <= 0:
                     continue
@@ -410,19 +448,30 @@ class Scheduler:
             assignments.setdefault(job, []).append(assignment)
             if (row["work"], row["number"]) in active or row["status"] == "active":
                 continue
-            latest.setdefault(job, assignment)
-        due = sorted(latest, key=lambda job: self.staleness.get(job, -3600))
-        for job in due[:8]:
-            if time.monotonic() - self.staleness.get(job, -3600) < 120:
+            latest.setdefault(job, (assignment, row["status"]))
+        now = time.monotonic()
+        due = sorted((self.staleness.get(job, -3600) + (15 if status in OSS_WAITING else 120), job)
+                     for job, (_, status) in latest.items())
+        for deadline, job in due[:8]:
+            if deadline > now:
                 break
-            self.staleness[job] = time.monotonic()
+            assignment, local_status = latest[job]
+            self.staleness[job] = now
             try:
-                result = self.work_status(latest[job])
+                result = self.work_status(assignment)
             except ProtocolError as exc:
                 if exc.status == 404:
                     continue
                 raise
             self.state.set("job:" + job, result)
+            if local_status in OSS_WAITING:
+                receipt = result.get("receipt")
+                if receipt and receipt["attempt"] == assignment["lease"]["attempt"]:
+                    self.state.mark(assignment, status="succeeded", receipt=receipt)
+                elif result["attempt"] != assignment["lease"]["attempt"] or result["work_state"] == "queued":
+                    self.state.mark(assignment, status="interrupted", message="服务端已退回待领")
+                elif result["work_state"] != local_status or result.get("failure_message"):
+                    self.observe_oss_state(assignment, result)
             if result["job_state"] == "deleted" and not any(identity(a) in active for a in assignments[job]):
                 self.prune_deleted(job, assignments)
 
@@ -471,6 +520,11 @@ class Scheduler:
                         atomic_json(directory / "progress.json", dict(stage=stage, completed=0, total=None))
                     if pending is None:
                         profile, artifacts = self.check_assignment(assignment)
+                        if (assignment.get("oss") or {}).get("delivery") == "auto":
+                            try:
+                                oss_credentials(self.root)
+                            except ValueError as exc:
+                                raise oss_delivery.DeliveryError(str(exc)) from None
                         checkpoint = self.load_checkpoint(assignment, directory, transfer.stop)
                         if checkpoint is None:
                             if (directory.parent / "outputs.json").exists():
@@ -489,14 +543,22 @@ class Scheduler:
                             report("reuse_outputs")
                             pending = self.upload_result(assignment, profile, checkpoint, directory, transfer)
                     events.send(dict(stage="commit_result", completed=0, total=None))
-                    receipt = transfer.json("POST", f"/work/{transfer.work}/complete", pending, "complete")
-                    self.state.mark(assignment, status="succeeded", receipt=receipt)
+                    if assignment.get("oss"):
+                        response = transfer.json("POST", f"/work/{transfer.work}/oss/submit", pending, "oss-submit")
+                        if response["state"] not in OSS_WAITING:
+                            raise ValueError("OSS 提交回执状态无效")
+                        self.record_oss_state(assignment, response["state"])
+                    else:
+                        receipt = transfer.json("POST", f"/work/{transfer.work}/complete", pending, "complete")
+                        self.state.mark(assignment, status="succeeded", receipt=receipt)
                 except (ValueError, KeyError, OSError, RuntimeError, ProtocolError) as exc:
                     if isinstance(exc, ProtocolError):
                         if exc.status not in {400, 413, 415, 416, 422}:
                             raise
                         message = f"{progress()['stage']} · {exc.detail or exc.code}"
                         error = dict(code="input_invalid", message=message, retryable=False)
+                    elif isinstance(exc, oss_delivery.DeliveryError):
+                        error = dict(code="input_invalid", message=str(exc), retryable=False)
                     elif not isinstance(exc, WorkFailure):
                         error = {"code": "input_invalid" if isinstance(exc, (ValueError, KeyError)) else "other",
                                  "message": f"{progress()['stage']} · {type(exc).__name__}", "retryable": isinstance(exc, OSError)}
@@ -512,6 +574,8 @@ class Scheduler:
                 receipt = result.get("receipt")
                 if receipt and receipt["attempt"] == assignment["lease"]["attempt"]:
                     self.state.mark(assignment, status="succeeded", receipt=receipt)
+                elif self.observe_oss_state(assignment, result):
+                    return
                 elif result["work_state"] != "leased" or result["attempt"] != assignment["lease"]["attempt"]:
                     self.state.mark(assignment, status="interrupted", message=watch.directive or result["work_state"])
                 else:
@@ -528,7 +592,7 @@ class Scheduler:
                            resources=str(self.root / "resources"), cpu_threads=self.cfg["cpu_threads"],
                            model_slots=self.cfg["model_slots"], render_slots=self.cfg["render_slots"])
             atomic_json(directory / "request.json", request)
-            env = {name: value for name, value in os.environ.items() if name != "FILM_WORKER_TOKEN"}
+            env = {name: value for name, value in os.environ.items() if name not in {"FILM_WORKER_TOKEN", *OSS_ENV}}
             env["PYTHONUTF8"] = "1"
             with (directory / "worker.log").open("ab") as log:
                 tree = ProcessTree([sys.executable, "-m", "film_worker", "child", str(directory)],
@@ -556,7 +620,8 @@ class Scheduler:
             artifacts[role] = {"name": str(path.relative_to(directory.resolve())), "sha256": digest(path),
                                "size": path.stat().st_size}
         checkpoint = dict(result, outputs=artifacts, attempt=assignment["lease"]["attempt"],
-                          input_manifest_sha256=assignment["input_manifest_sha256"], versions=self.versions)
+                          input_manifest_sha256=assignment["input_manifest_sha256"], versions=self.versions,
+                          transport=oss_delivery.transport(assignment))
         atomic_json(directory.parent / "outputs.json", checkpoint)
         return self.upload_result(assignment, profile, checkpoint, directory, transfer)
 
@@ -567,6 +632,7 @@ class Scheduler:
             if (type(attempt) is not int or not 1 <= attempt <= assignment["lease"]["attempt"] or
                     checkpoint["input_manifest_sha256"] != assignment["input_manifest_sha256"] or
                     checkpoint["versions"] != self.versions or
+                    checkpoint.get("transport") != oss_delivery.transport(assignment) or
                     set(checkpoint["outputs"]) != output_roles(assignment)):
                 return None
             for artifact in checkpoint["outputs"].values():
@@ -597,6 +663,15 @@ class Scheduler:
             atomic_json(self.root / "local-reviews" / opaque(assignment["job_id"]) / (manifest["sha256"] + ".json"),
                         dict(work_id=transfer.work, attempt=result["attempt"]))
         with slot(self.root / "resources", "transfer", self.cfg["transfer_slots"], transfer.stop):
+            if assignment.get("oss"):
+                artifacts = {role: (self.checkpoint_path(directory, result["attempt"], item), ROLE_TYPES[role], item["sha256"])
+                             for role, item in result["outputs"].items()}
+                def progress(done, total):
+                    atomic_json(directory / "progress.json", dict(stage="upload_oss", completed=done, total=total))
+                payload = oss_delivery.prepare_submission(assignment, artifacts, result.get("final_verification"),
+                                                          self.root, directory, transfer, progress)
+                self.state.mark(assignment, pending=payload)
+                return payload
             for role, artifact in result["outputs"].items():
                 path = self.checkpoint_path(directory, result["attempt"], artifact)
                 def update(done, total):

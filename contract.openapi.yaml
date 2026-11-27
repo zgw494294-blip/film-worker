@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
   title: 电影复刻 · 建模执行端接口
-  version: 1.1.1
-  description: '公网管理端提供的 HTTPS 出站拉取协议。服务端权威保存作业、版本、审批、工件和交付。建模节点只需访问一个管理端地址，以节点令牌领取、续租、上报和回传。节点合同与管理端 UI 用户接口独立。
+  version: 1.2.0
+  description: '公网管理端提供的 HTTPS 出站拉取协议。服务端保存作业、版本、审批和交付记录。建模节点以一个管理端地址为入口，使用节点令牌领取、续租、上报和回传。节点接口与管理端 UI 用户接口独立。
 
-    建模执行端运行在 Mac 上。下列标识、角色、路径、状态、哈希算法及字节范围用于管理端与各台 Mac 之间互操作。工件清单中的 JSON 是 UTF-8 文件；普通工件哈希针对实际文件字节，明确标有 JCS 的字段才对规范化 JSON 计算哈希。HTTP
+    建模执行端运行在 macOS 和 Windows 上。OSS 作业可由节点直接下载原片、上传产物。工件清单中的 JSON 是 UTF-8 文件；普通工件哈希针对实际文件字节，明确标有 JCS 的字段才对规范化 JSON 计算哈希。HTTP
     时间均为带时区的 RFC 3339。'
 servers:
 - url: https://{host}/api/v1
@@ -48,13 +48,15 @@ x-artifact-contract:
     $ref: '#/components/schemas/ShotMetadata'
   review_bundle:
     $ref: '#/components/schemas/ReviewBundleIndex'
+  review_index:
+    $ref: '#/components/schemas/OSSReviewIndex'
   version_manifest:
     $ref: '#/components/schemas/VersionManifest'
   feedback_manifest:
     $ref: '#/components/schemas/FeedbackManifest'
   approval_manifest:
     $ref: '#/components/schemas/ApprovalManifest'
-  production_report: UTF-8 Markdown 制作记录；记录本轮处理内容、约束、实际环境和核验结果。
+  production_report: UTF-8 JSON 制作记录，包含工单类别、帧数、制作环境和备注。
   white_video: 最终白模 MP4；单幅交付尺寸、原片时间线与规定同期声。
   comparison_video: 最终上下对比 MP4；宽度为单幅宽度，高度为单幅交付高度两倍。
   delivery_bundle:
@@ -75,6 +77,11 @@ paths:
         schema:
           const: node_local_v1
         description: 此次注册的实例支持同机审片。旧版可省略。仅服务端给工单加 review_storage 时启用。
+      - name: X-Film-Worker-Review-Upload
+        in: header
+        schema:
+          const: rejected_frames_v1
+        description: 支持 ZIP 增量返修。由服务端用冻结入参 review_upload 启用。
       requestBody:
         required: true
         content:
@@ -332,6 +339,75 @@ paths:
           $ref: '#/components/responses/Busy'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /work/{work_id}/oss/objects:
+    post:
+      operationId: beginOSSObjects
+      tags: [工件]
+      summary: 分配逐图直传目录
+      description: 仅适用于 objects_v1 自动交付。按返回目录上传，使用 OSS V4 签名、规定的 MIME 与 x-oss-meta-sha256。记录各文件的 OSS 版本 ID。
+      parameters: &ossLeaseParameters
+      - $ref: '#/components/parameters/WorkID'
+      - $ref: '#/components/parameters/Lease'
+      - $ref: '#/components/parameters/Fence'
+      - $ref: '#/components/parameters/Attempt'
+      - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OSSManifestBinding'
+      responses:
+        '201':
+          description: 分配当前领取的 OSS 上传目录。
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/OSSLocation'
+                - type: object
+                  required: [upload_id]
+                  properties:
+                    upload_id:
+                      $ref: '#/components/schemas/ID'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
+  /work/{work_id}/oss/submit:
+    post:
+      operationId: submitOSSWork
+      tags: [工作, 工件]
+      summary: 登记 OSS 交付
+      description: 自动方式登记对象声明或整包摘要，交给服务端校验。手动方式只传冻结摘要，进入等待管理员上传。本次交付被接收后，可结束续租并通过作业状态查询最终入库结果。
+      parameters: *ossLeaseParameters
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OSSSubmission'
+      responses:
+        '202':
+          description: 已等待人工上传，或已进入归档校验。
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state:
+                    enum: [awaiting_manual, verifying]
+                  transfer_id:
+                    $ref: '#/components/schemas/ID'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Invalid'
   /work/{work_id}/uploads:
     post:
       operationId: beginUpload
@@ -568,6 +644,14 @@ paths:
           $ref: '#/components/responses/Missing'
         '409':
           $ref: '#/components/responses/Conflict'
+        '302':
+          description: OSS 工件下载地址。对 Location 重新发起请求，可带 Range。仅向管理端发送设备鉴权和租约头。
+          headers:
+            Location:
+              required: true
+              schema:
+                type: string
+                format: uri
         '416':
           $ref: '#/components/responses/Range'
         '429':
@@ -1012,6 +1096,8 @@ components:
       enum:
       - queued
       - leased
+      - awaiting_manual
+      - verifying
       - succeeded
       - paused
       - stopped
@@ -1039,6 +1125,7 @@ components:
       - scene_bundle
       - shot_metadata
       - review_bundle
+      - review_index
       - version_manifest
       - feedback_manifest
       - approval_manifest
@@ -1164,6 +1251,12 @@ components:
       - render_backends
       - environment
       properties:
+        oss_delivery:
+          type: boolean
+          description: 支持 OSS 整包交付和异步回执。
+        oss_objects:
+          type: boolean
+          description: 支持 objects_v1 逐图直传和 OSS 整包成片。
         work_kinds:
           type: array
           items:
@@ -1409,6 +1502,9 @@ components:
           description: 仅 finalize 工单可传。1080p 将画幅按原比例限制在横屏 1920×1080 或竖屏 1080×1920，输出轴取最接近的偶数。4k 使用基版的原生交付画幅，当前默认宽 3840。省略时沿用已通过版本原生交付画幅。
         review_storage:
           $ref: '#/components/schemas/LocalReviewStorage'
+        review_upload:
+          const: rejected_frames_v1
+          description: 仅 ZIP 返修工单会下发。使用 feedback_manifest.frames 冻结本轮上传范围。
         artifacts:
           type: array
           items:
@@ -1674,7 +1770,9 @@ components:
           $ref: '#/components/schemas/InputManifest'
         input_manifest_sha256:
           $ref: '#/components/schemas/Sha256'
-      description: input_manifest_sha256 为 input_manifest 完整 JCS 的 SHA-256；所有作业输入均可由新节点从管理端下载。
+        oss:
+          $ref: '#/components/schemas/OSSAssignment'
+      description: input_manifest_sha256 为 input_manifest 完整 JCS 的 SHA-256。oss 是本次领取的传输参数，位于冻结清单之外。
     WorkHeartbeat:
       type: object
       additionalProperties: false
@@ -2198,6 +2296,148 @@ components:
         - 2
         rgb8_hex: 000000ffffff
         expected_sha256: bd16c1d6572399a3c44d67a1c8445b907f6ff97a4a0d16b65a7ae046be695ca1
+    ReviewDelta:
+      type: object
+      additionalProperties: false
+      required: [mode, base_version, base_manifest_sha256, frames, full_files_sha256]
+      properties:
+        mode:
+          const: rejected_frames_v1
+        base_version:
+          type: integer
+          minimum: 1
+        base_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        frames:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+        full_files_sha256:
+          $ref: '#/components/schemas/Sha256'
+          description: 完整文件索引按 path 排序后的 JCS SHA-256。服务端合并基版后验证。
+    OSSLocation:
+      type: object
+      required: [region, bucket, key]
+      properties:
+        region:
+          type: string
+        bucket:
+          type: string
+        key:
+          type: string
+    OSSAssignment:
+      type: object
+      required: [source_url, delivery, upload]
+      properties:
+        source_url:
+          type: string
+          format: uri
+        delivery:
+          enum: [auto, manual]
+        upload:
+          oneOf:
+          - $ref: '#/components/schemas/OSSLocation'
+          - type: 'null'
+          description: 仅自动 ZIP 交付提供 OSS 文件位置。
+        protocol:
+          const: objects_v1
+          description: 省略时沿用 OSS 整包 ZIP。
+        review_scope:
+          enum: [all_frames, rejected_frames, null]
+          description: 从首版至出片分别为 all_frames、rejected_frames、null。
+    OSSManifestBinding:
+      type: object
+      required: [input_manifest_sha256]
+      properties:
+        input_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+    OSSImage:
+      type: object
+      required: [number, size_bytes, sha256]
+      properties:
+        number:
+          type: integer
+          minimum: 1
+          maximum: 2400
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 14680064
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+    OSSReviewIndex:
+      type: object
+      required: [job_id, version, source_sha256, timeline_sha256, input_manifest_sha256, review_storage, review_media, base_manifest_sha256, frames]
+      properties:
+        job_id:
+          $ref: '#/components/schemas/ID'
+        version:
+          type: integer
+          minimum: 1
+        source_sha256:
+          $ref: '#/components/schemas/Sha256'
+        timeline_sha256:
+          $ref: '#/components/schemas/Sha256'
+        input_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        review_storage:
+          $ref: '#/components/schemas/LocalReviewStorage'
+        review_media:
+          const: objects_v1
+        base_manifest_sha256:
+          oneOf:
+          - $ref: '#/components/schemas/Sha256'
+          - type: 'null'
+        frames:
+          type: array
+          minItems: 1
+          maxItems: 2400
+          items:
+            $ref: '#/components/schemas/OSSImage'
+      description: 首版包含全部帧。返修仅包含打回帧，完整帧记录见 version.json。
+    OSSSubmission:
+      type: object
+      additionalProperties: false
+      required: [input_manifest_sha256]
+      dependentRequired:
+        size_bytes: [sha256]
+        sha256: [size_bytes]
+        upload_id: [objects]
+        objects: [upload_id]
+        final_verification: [objects]
+      properties:
+        input_manifest_sha256:
+          $ref: '#/components/schemas/Sha256'
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 17179869184
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+        upload_id:
+          $ref: '#/components/schemas/ID'
+        objects:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [size_bytes, sha256, version_id]
+            properties:
+              size_bytes:
+                type: integer
+                minimum: 1
+                maximum: 17179869184
+              sha256:
+                $ref: '#/components/schemas/Sha256'
+              version_id:
+                type: string
+        final_verification:
+          $ref: '#/components/schemas/FinalVerification'
+      description: 手动仅传冻结摘要。自动 ZIP 传大小和 SHA-256。逐图直传传上传 ID 和相对路径到对象声明的映射，出片附 final_verification。
     ReviewBundleIndex:
       type: object
       additionalProperties: false
@@ -2220,6 +2460,10 @@ components:
         target_version:
           type: integer
           minimum: 1
+        review_delta:
+          $ref: '#/components/schemas/ReviewDelta'
+        review_media:
+          const: objects_v1
         source_sha256:
           $ref: '#/components/schemas/Sha256'
         timeline_sha256:
@@ -2247,7 +2491,7 @@ components:
       description: >-
         ZIP 根目录含 index.json。files 逐一索引 ZIP 内的其他文件。集中存储时包含上下对比 JPEG 和白模 PNG。
         同机模式只含 pairs/*.jpg，各帧的 white_png_path 指向执行端本机文件，服务端无需读取。
-        管理端验证 ZIP 内实际条目的大小、SHA-256、JPEG 尺寸及帧覆盖后才入库。
+        增量 ZIP 的 files 仅索引打回帧文件，frames 仍是完整列表。管理端与基版合并后再验证文件与帧覆盖。
       allOf:
       - if:
           required: [review_storage]
@@ -2286,6 +2530,12 @@ components:
         version:
           type: integer
           minimum: 1
+        review_delta:
+          $ref: '#/components/schemas/ReviewDelta'
+        review_media:
+          const: objects_v1
+        review_index_sha256:
+          $ref: '#/components/schemas/Sha256'
         source_sha256:
           $ref: '#/components/schemas/Sha256'
         timeline_sha256:
@@ -2531,6 +2781,13 @@ components:
           $ref: '#/components/schemas/ID'
         work_state:
           $ref: '#/components/schemas/WorkState'
+        stage:
+          type: [string, 'null']
+        failure:
+          type: [string, 'null']
+        failure_message:
+          type: string
+          description: OSS 归档校验失败的说明。
         attempt:
           type: integer
           minimum: 0

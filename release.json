@@ -1,12 +1,12 @@
 {
-  "version": "0.1.4",
-  "sequence": 5,
+  "version": "0.1.5",
+  "sequence": 6,
   "platforms": [
     "macos-arm64",
     "windows-x86_64"
   ],
   "protocol": 1,
   "state_format": 1,
-  "lock_sha256": "612a7c572921e5a7c774372dba5f7026e2d6982202c7ee30258dafe715a780c5",
+  "lock_sha256": "6b2a6b6ab5ca9098ad4283d7d0d96a0f26b73686dcc14f9c071c75381ec4a457",
   "update_remote": "https://github.com/zgw494294-blip/film-worker.git"
 }

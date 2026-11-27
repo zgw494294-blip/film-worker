@@ -5,6 +5,8 @@ import re
 import subprocess
 import tempfile
 
+from .secrets import OSS_ENV
+
 def options(binary, config, directory, *, sandbox, blender_config=None):
     command = [binary, "exec", "--skip-git-repo-check", "--sandbox", sandbox,
                "-c", 'approval_policy="never"', "-c", "project_doc_max_bytes=0",
@@ -33,7 +35,7 @@ def evidence(header):
 def test(binary, profile):
     with tempfile.TemporaryDirectory(prefix="film-model-test-") as directory:
         command = [*options(binary, profile, directory, sandbox="read-only"), "只回答 FILM_WORKER_OK"]
-        env = {key: value for key, value in os.environ.items() if key != "FILM_WORKER_TOKEN"}
+        env = {key: value for key, value in os.environ.items() if key not in {"FILM_WORKER_TOKEN", *OSS_ENV}}
         try:
             output = subprocess.run(command, cwd=directory, check=True, timeout=100, capture_output=True,
                                     encoding="utf-8", errors="replace", env=env)

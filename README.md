@@ -13,7 +13,13 @@
 
 机器接口见 `contract.openapi.yaml`。接入 movie-review 时，在其「执行管理 → 设备」复制服务地址、设备标识和建模 Token。内网自签证书可在节点配置填写本机 PEM 格式的服务器证书或 CA 路径，HTTPS 同时校验证书名称。联调模拟服务时可在子命令前加 `--test-http`。新工单无需制作档案或规则包，旧档案字段仅用于历史协议兼容。
 
-movie-review 支持设备心跳上报磁盘可用与预留字节数，空间低于预留值时暂停领取。其审核包上限为 2400 帧和 256 MiB 的展开大小。超过限制时，执行端在工单记录显示服务端的具体拒收原因。[movie-review 部署与接口说明](https://github.com/zhaojin-0427/movie-review/blob/cfb2c8f3e4a5c0bd950ba3c5a1f3e5a739c6aca0/README.md)
+movie-review 支持设备心跳上报磁盘可用与预留字节数，空间低于预留值时暂停领取。执行端审核包上限为 2400 帧、每张 JPG 14 MiB、ZIP 展开后 16 GiB。网页传统手工送审的 ZIP 上限仍为 256 MiB。[movie-review 服务端说明](https://github.com/zhaojin-0427/movie-review/blob/daa9c7df4a8b4e3448db35c9ec3f00778d64b695/README.md)
+
+## OSS 交付
+
+在服务端「执行管理」设置 OSS 和设备的交付方式。执行端按每次领单返回的参数选择原来的服务端分片上传、OSS 整包交付或 OSS 逐图直传。使用自动 OSS 交付的设备需在本机面板的「OSS 自动交付」填写 RAM AccessKey，或由部署环境注入 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`，临时凭据同时提供 `OSS_SESSION_TOKEN`。面板保存的凭据进入系统凭据库。逐图直传需要同机审片和支持对象版本控制的审核 Bucket。[OSS 整包交付协议](https://github.com/zhaojin-0427/movie-review/blob/daa9c7df4a8b4e3448db35c9ec3f00778d64b695/docs/OSS执行端接入.md) · [OSS 逐图直传协议](https://github.com/zhaojin-0427/movie-review/blob/daa9c7df4a8b4e3448db35c9ec3f00778d64b695/docs/OSS逐图直传协议.md)
+
+手动交付时，执行端生成 ZIP 后显示本机文件路径，由管理员在服务端工单详情上传。自动交付收到回执后显示「归档校验中」，服务端确认入库后才显示成功。两种方式等待期间释放制作槽位。
 
 ## 包内工作流
 
@@ -23,6 +29,8 @@ movie-review 支持设备心跳上报磁盘可用与预留字节数，空间低�
 - macOS 包内含 Blender 5.2.3 后台配置。Blender 编译、预览、检查和渲染统一通过启动器。Codex 进程也继承这份临时配置，适用于实际定位到的 Metal 启动探测崩溃。
 
 支持服务端启用的同机审片。首制、返修和出片固定由同一个执行端实例处理，首制和返修上传上下对比 JPG 与小型清单。Blender 工程和无损白模 PNG 按审核版本保存在节点数据目录，出片时按冻结审批校验后使用。旧服务和已在途的集中存储作业继续使用原协议。[服务端接入说明](docs/服务端同机审片接入.md)
+
+收到增量返修工单时，执行端验证整版画面，仅回传打回范围内的图片。若返修改动涉及范围外的帧，执行端报告受影响帧，需在标注端扩展本轮范围后重领。
 
 标有 PQ 或 HLG 的原片通过随包 FFmpeg 的色调映射生成 BT.709 抽帧和缩略图。归档包中的原始视频保持上传文件的字节和色彩信息。[FFmpeg 色调映射选项](https://ffmpeg.org/ffmpeg-filters.html#scale)
 

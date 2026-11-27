@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from . import model, startup
 from .releases import RESTART_FOR_UPDATE, Releases
 from .scheduler import Scheduler
-from .secrets import read_token, store_token
+from .secrets import read_token, store_oss_credentials, store_token
 from .settings import atomic_json, inspect_tools, load, resolve_tools, validate_config
 
 
@@ -190,6 +190,8 @@ class Handler(BaseHTTPRequestHandler):
                     if node.runner and node.runner.is_alive():
                         raise ValueError("请先暂停领单，等待在途工单完成，再停止节点并保存")
                     config = validate_config(payload["config"])
+                    if payload.get("oss_key_id") or payload.get("oss_key_secret"):
+                        store_oss_credentials(node.root, payload.get("oss_key_id"), payload.get("oss_key_secret"))
                     if payload.get("token"):
                         store_token(node.root, payload["token"])
                     atomic_json(node.config, config)

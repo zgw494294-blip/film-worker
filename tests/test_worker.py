@@ -33,6 +33,8 @@ class MockServer(ThreadingHTTPServer):
         self.begin = None
         self.uploaded = {}
         self.received_ranges = []
+        self.object_request_headers = []
+        self.redirect_artifact = False
 
     def upload(self):
         parts = [dict(part_no=i, start=start, end=start+len(data)-1, sha256=sha(data))
@@ -60,7 +62,20 @@ class MockHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         server = self.server
         if self.path.startswith("/api/v1/artifacts/"):
-            self.send_artifact(server)
+            if server.redirect_artifact:
+                server.manager_request_headers = dict(self.headers.items())
+                self.answer(302, Location=f"http://127.0.0.1:{server.server_port}/object")
+            else:
+                self.send_artifact(server)
+        elif self.path.startswith("/object"):
+            server.object_request_headers.append(dict(self.headers.items()))
+            if self.path.endswith("?expired=1"):
+                self.answer(403)
+            else:
+                data = server.blob
+                start = int(self.headers["Range"].removeprefix("bytes=").removesuffix("-"))
+                self.answer(206, data[start:], ETag='"oss-multipart-etag"',
+                            **{"Content-Range": f"bytes {start}-{len(data)-1}/{len(data)}"})
         elif self.path == "/api/v1/uploads/u1":
             self.answer(200, server.upload())
         else:
@@ -104,6 +119,35 @@ class MockHandler(BaseHTTPRequestHandler):
 
 
 class TransferTests(unittest.TestCase):
+    def test_expired_oss_source_url_refreshes_without_forwarding_worker_headers(self):
+        with tempfile.TemporaryDirectory() as tmp, MockServer() as server:
+            server.redirect_artifact = True
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                root = Path(tmp)
+                checksum = sha(server.blob)
+                (root / (checksum + ".part")).write_bytes(server.blob[:7])
+                host = f"http://127.0.0.1:{server.server_port}"
+                assignment = dict(work_id="w1", lease=dict(lease_id="lease", attempt=1, fence=2),
+                                  oss=dict(source_url=host + "/object?expired=1"))
+                transfer = Transfer(Client(host, "test-token", test_http=True), assignment,
+                                    threading.Event(), root / "cache")
+                result = transfer.download(dict(artifact_id="a1", role="source_video",
+                                                sha256=checksum, size_bytes=len(server.blob)), root)
+                self.assertEqual(result.read_bytes(), server.blob)
+                manager = {name.lower(): value for name, value in server.manager_request_headers.items()}
+                self.assertEqual(manager["authorization"], "Bearer test-token")
+                self.assertEqual(manager["x-lease-id"], "lease")
+                self.assertEqual(len(server.object_request_headers), 2)
+                for request in server.object_request_headers:
+                    headers = {name.lower(): value for name, value in request.items()}
+                    self.assertEqual(headers["range"], "bytes=7-")
+                    self.assertTrue(headers.keys().isdisjoint({"authorization", "x-lease-id", "x-fence", "x-attempt", "if-range"}))
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_range_resume_and_exact_multipart_wire_format(self):
         with tempfile.TemporaryDirectory() as tmp, MockServer() as server:
             thread = threading.Thread(target=server.serve_forever)
